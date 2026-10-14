@@ -1,0 +1,869 @@
+export type Severity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
+
+export type ConnectionStatus = 'CONNECTED' | 'SYNCING' | 'OFFLINE' | 'RETRYING' | 'AWAITING_FEED' | 'UNAVAILABLE';
+
+export type DataClassification = 'LIVE' | 'CACHED' | 'SEED' | 'SIMULATED' | 'FALLBACK' | 'UNAVAILABLE';
+
+export interface DataProvenance {
+  source: string;
+  timestamp: string;
+  provider: string;
+  /**
+   * Model or detector confidence, 0–100.
+   *
+   * Optional because most sources do not publish one. A measurement — a gauge
+   * reading, a vehicle count — has no confidence score, and inventing a number
+   * so the field is always populated is what produced the interface's hardcoded
+   * "98%". Absent means unscored, and the UI renders it as such.
+   */
+  confidence?: number;
+  latencyMs: number;
+  lastUpdated: string;
+  classification?: DataClassification;
+  unavailableReason?: string;
+}
+
+export interface ConnectionHealthInfo {
+  status: ConnectionStatus;
+  latencyMs: number;
+  lastSync: string;
+  provider: string;
+  details?: string;
+  classification?: DataClassification;
+  unavailableReason?: string;
+}
+
+export type ConnectionHealthMap = Record<string, ConnectionHealthInfo>;
+
+export interface FlightNode {
+  id: string;
+  callsign: string;
+  lat: number;
+  lng: number;
+  altitudeMeters: number;
+  speedKmh: number;
+  heading: number;
+  origin: string;
+  destination: string;
+  aircraftType: string;
+  status: 'AIRBORNE' | 'APPROACHING' | 'LANDED';
+  provenance: DataProvenance;
+}
+
+/**
+ * The platform's destinations, named by operational domain.
+ *
+ * These are the labels an operator sees, and they double as the router's keys —
+ * `src/components/navConfig.ts` maps each one to a URL path. The grouping into
+ * Command Center / Intelligence / City Systems / Assets / Insights /
+ * Administration lives there too; this union is only the flat set.
+ *
+ * The names describe what an operator is looking at, not which feature shipped
+ * it: a junction camera is an asset of the city, so it lives under Cameras, and
+ * corridor speeds are part of how the city moves, so they live under Mobility.
+ */
+export type NavItem =
+  // Command Center
+  | 'Command Center'
+  | 'Live City'
+  | 'Active Situations'
+  // Intelligence
+  | 'Intelligence'
+  | 'AI Analysis'
+  | 'Event Correlation'
+  // City systems
+  | 'Mobility'
+  | 'Environment'
+  | 'Infrastructure'
+  | 'Utilities'
+  // Assets
+  | 'Resources'
+  | 'Cameras'
+  | 'Drones'
+  | 'Sensors'
+  | 'Vehicles'
+  | 'Aviation'
+  // Insights
+  | 'Analytics'
+  | 'Reports'
+  | 'History'
+  | 'Settings'
+  | 'Users & Access'
+  | 'Knowledge Graph'
+  | 'Event Engine'
+  | 'Prediction Engine'
+  | 'What-If Simulation'
+  | 'Decision Support'
+  | 'Action Center'
+  | 'Feedback Loop'
+  | 'Case Management'
+  | 'Timeline Replay'
+  | 'Data Fabric'
+  | 'Audit Logs';
+
+export type OperationalRole =
+  | 'TRAFFIC_OPERATOR'
+  | 'EMERGENCY_OPERATOR'
+  | 'CITY_ADMIN'
+  | 'ANALYST';
+
+export type OperationalMapMode =
+  | 'TRAFFIC_OPS'
+  | 'EMERGENCY_OPS'
+  | 'ENVIRONMENTAL_OPS'
+  | 'AVIATION_OPS';
+
+export type CityEntityType =
+  | 'ROAD'
+  | 'INTERSECTION'
+  | 'VEHICLE'
+  | 'EMERGENCY_VEHICLE'
+  | 'PUBLIC_TRANSPORT'
+  | 'INCIDENT'
+  | 'CAMERA'
+  | 'BUILDING'
+  | 'INFRASTRUCTURE'
+  | 'GEO_REGION'
+  | 'EVENT'
+  | 'ALERT'
+  | 'WEATHER_CONDITION'
+  | 'OPERATOR'
+  | 'AGENCY'
+  | 'SENSOR';
+
+export interface CityEntity {
+  id: string;
+  name: string;
+  type: CityEntityType;
+  status: string;
+  lat?: number;
+  lng?: number;
+  address?: string;
+  provenance: DataProvenance;
+  lastUpdate: string;
+  attributes: Record<string, any>;
+  connectedEntityIds: string[];
+  recentEventIds: string[];
+  activeAlertIds: string[];
+}
+
+export interface EntityRelationship {
+  id: string;
+  sourceId: string;
+  targetId: string;
+  relationType: 'TRAVERSES' | 'CONNECTS_TO' | 'AFFECTED_BY' | 'MONITORED_BY' | 'ASSIGNED_TO' | 'LOCATED_IN' | 'PRECEDES';
+  label: string;
+  strength?: number;
+}
+
+export interface CityEvent {
+  id: string;
+  title: string;
+  category: string;
+  severity: Severity;
+  timestamp: string;
+  lat?: number;
+  lng?: number;
+  locationName?: string;
+  source: string;
+  confidence: number;
+  what: string;
+  where: string;
+  when: string;
+  affectedEntityIds: string[];
+  relatedEventIds: string[];
+  evaluationNotes: string;
+  status: 'NEW' | 'EVALUATING' | 'ESCALATED' | 'RESOLVED';
+}
+
+export interface DataFabricSource {
+  id: string;
+  name: string;
+  category: string;
+  status: 'CONNECTED' | 'ACTIVE' | 'DELAYED' | 'OFFLINE' | 'SIMULATED' | 'UNAVAILABLE';
+  lastSync: string;
+  updateFrequencySec: number;
+  itemCount: number;
+  latencyMs: number;
+  provenance: DataProvenance;
+  note?: string;
+}
+
+export type IntelligenceClassification = 'OBSERVED' | 'DETECTED' | 'INFERRED' | 'PREDICTED' | 'SIMULATED';
+
+export interface ExplainableIntelligenceCard {
+  id: string;
+  title: string;
+  classification: IntelligenceClassification;
+  situation: string;
+  evidence: string[];
+  dataSources: string[];
+  confidencePct: number;
+  potentialImpact: string;
+  relatedEntityIds: string[];
+  possibleNextDevelopments: string[];
+  timestamp: string;
+}
+
+export interface PredictionRecord {
+  id: string;
+  target: string;
+  predictionHorizonMinutes: number;
+  confidencePct: number;
+  sourceData: string[];
+  modelStatus: 'ACTIVE' | 'CALIBRATING' | 'UNAVAILABLE';
+  timestamp: string;
+  predictedValue: string;
+  details: string;
+}
+
+export interface SimulationScenario {
+  id: string;
+  title: string;
+  type: 'ROAD_BLOCK' | 'EMERGENCY_PRIORITY' | 'WEATHER_DISRUPTION' | 'INFRASTRUCTURE_FAILURE';
+  description: string;
+  isLive: false; // Always false
+  createdAt: string;
+  parameters: {
+    blockedRoadId?: string;
+    emergencyVehicleId?: string;
+    targetDestination?: string;
+  };
+  results: {
+    affectedRoads: string[];
+    trafficCongestionIncreasePct: number;
+    affectedIntersections: string[];
+    emergencyRouteEtaMin: number;
+    alternateRouteNames: string[];
+    signalAdjustmentRecommendations: string[];
+  };
+}
+
+export interface DecisionOption {
+  id: string;
+  optionLabel: 'A' | 'B' | 'C';
+  title: string;
+  expectedImpact: string;
+  affectedArea: string;
+  confidencePct: number;
+  assumptions: string[];
+  risks: string[];
+  requiredAction: string;
+}
+
+export interface DecisionRecommendation {
+  id: string;
+  incidentId: string;
+  situationSummary: string;
+  options: DecisionOption[];
+  recommendedOptionId: string;
+  recommendationReason: string;
+  timestamp: string;
+  status: 'PENDING_OPERATOR_REVIEW' | 'APPROVED' | 'REJECTED' | 'EXPIRED';
+}
+
+export interface ActionItem {
+  id: string;
+  incidentId: string;
+  recommendationId?: string;
+  title: string;
+  actionType: string;
+  status: 'PROPOSED' | 'APPROVED' | 'IN_PROGRESS' | 'COMPLETED' | 'REJECTED' | 'EXPIRED';
+  operator: string;
+  timestamp: string;
+  reason: string;
+  relatedEventId?: string;
+  affectedEntityIds: string[];
+  executionTarget?: string;
+}
+
+export interface FeedbackRecord {
+  id: string;
+  actionId: string;
+  incidentId: string;
+  timestamp: string;
+  metricName: string;
+  expectedOutcome: string;
+  actualOutcome: string;
+  deviationPct: number;
+  outcomeGrade: 'EXCEEDED' | 'MET' | 'DEGRADED' | 'FAILED';
+  lessonsLearned: string;
+}
+
+export interface CityCase {
+  id: string; // e.g. "INCIDENT #ARKA-9021"
+  title: string;
+  category: string;
+  priority: Severity;
+  status: 'OPEN' | 'INVESTIGATING' | 'ACTION_IN_PROGRESS' | 'RESOLVED' | 'CLOSED';
+  locationName: string;
+  lat: number;
+  lng: number;
+  timestamp: string;
+  timeline: { time: string; event: string; actor: string }[];
+  relatedEntityIds: string[];
+  evidenceSources: string[];
+  intelligenceCards: ExplainableIntelligenceCard[];
+  recommendations: DecisionRecommendation[];
+  actions: ActionItem[];
+  assignedOperators: string[];
+  postIncidentAnalysis?: string;
+}
+
+export interface AuditLog {
+  id: string;
+  who: string;
+  didWhat: string;
+  when: string;
+  targetEntityId?: string;
+  reason?: string;
+}
+
+export interface TrafficCameraFeed {
+  id: string;
+  name: string;
+  road: string;
+  junction: string;
+  zone: string;
+  lat: number;
+  lng: number;
+  directionDeg: number;
+  status: 'ONLINE' | 'OFFLINE' | 'WARNING';
+  streamUrl: string;
+  fps: number;
+  resolution: string;
+  latencyMs: number;
+  recordingAvailable: boolean;
+  aiEnabled: boolean;
+  healthScore: number;
+  installedDate: string;
+  owner: string;
+  aiAnalytics: {
+    vehicleCount: number;
+    congestionLevel: 'LOW' | 'MODERATE' | 'HEAVY' | 'SEVERE';
+    pedestrianCount: number;
+    avgSpeedKmh: number;
+    queueLengthMeters: number;
+    stoppedVehicles: number;
+    confidencePct: number;
+  };
+  nearestJunction: string;
+  nearestPoliceStation: string;
+  nearestHospital: string;
+}
+
+export interface Agency {
+  id: string;
+  name: string;
+  shortName: string;
+  status: 'ONLINE' | 'STANDBY' | 'BUSY' | 'OFFLINE';
+  personnel: number;
+  activeUnits: number;
+  contact: string;
+  icon: string;
+}
+
+export type WorkflowStage =
+  | 'DETECTED'
+  | 'VALIDATE'
+  | 'SEVERITY'
+  | 'EXACT_LOCATION'
+  | 'BUFFER_ZONE'
+  | 'NEARBY_RESPONDERS'
+  | 'TRAFFIC_ANALYSIS'
+  | 'WEATHER_ANALYSIS'
+  | 'INFRASTRUCTURE_CONSTRAINTS'
+  | 'RECOMMENDED_RESPONSE'
+  | 'NOTIFY_AGENCIES'
+  | 'DEPLOY_RESOURCES'
+  | 'MONITOR_PROGRESS'
+  | 'UPDATE_STATE'
+  | 'RESOLVE'
+  | 'ARCHIVE_ANALYTICS';
+
+export interface WorkflowTimelineEvent {
+  id: string;
+  timestamp: string;
+  stage: WorkflowStage;
+  label: string;
+  description: string;
+  actor: 'AI_ENGINE' | 'OPERATOR' | 'OPENCLAW' | 'KAFKA_BUS' | 'TELEGRAM_BOT';
+  details?: Record<string, any>;
+}
+
+export interface AgencyWorkflowStatus {
+  agencyId: string;
+  agencyName: string;
+  role: string;
+  notificationStatus: 'PENDING' | 'NOTIFIED' | 'ACKNOWLEDGED' | 'FAILED';
+  dispatchStatus: 'UNASSIGNED' | 'DISPATCHED' | 'EN_ROUTE' | 'ON_SCENE' | 'COMPLETED';
+  unitsAssigned: number;
+  etaMinutes: number;
+  currentActivity: string;
+  lastUpdated: string;
+}
+
+export interface ResourceRecommendation {
+  unitId: string;
+  unitName: string;
+  unitType: string;
+  distanceKm: number;
+  etaMinutes: number;
+  capabilityMatchPct: number;
+  rank: number;
+  status: 'AVAILABLE' | 'EN_ROUTE' | 'DISPATCHED';
+  baseStation: string;
+}
+
+export interface IncidentContextData {
+  gps: { lat: number; lng: number; address: string };
+  camerasNearby: { id: string; name: string; road: string; status: string }[];
+  trafficConditions: { congestionLevel: string; avgSpeedKmh: number; affectedRoads: string[] };
+  weatherConditions: { tempC: number; condition: string; windKmh: number; rainMm: number };
+  nearbyHospitals: { name: string; distKm: number; bedsAvailable: number }[];
+  policeStations: { name: string; distKm: number }[];
+  fireStations: { name: string; distKm: number }[];
+  infrastructureStatus: { powerGrid: string; drainage: string; bridgeStatus: string };
+  relatedNews: { headline: string; publisher: string; time: string }[];
+  historicalIncidentsCount: number;
+}
+
+export interface IncidentAnalytics {
+  responseTimeSec: number;
+  dispatchTimeSec: number;
+  travelTimeSec: number;
+  arrivalTimeSec: number;
+  totalResolutionTimeMin: number;
+  slaCompliant: boolean;
+  resourceUtilizationPct: number;
+  agencyPerformanceScore: number;
+}
+
+export interface Incident {
+  id: string;
+  category: 'TRAFFIC' | 'FIRE' | 'FLOOD' | 'UTILITY' | 'SECURITY' | 'MEDICAL';
+  title: string;
+  priority: Severity;
+  description: string;
+  location: {
+    name: string;
+    lat: number;
+    lng: number;
+    address: string;
+  };
+  timestamp: string;
+  agencyAssigned: string;
+  aiConfidence: number;
+  recommendedAction: string;
+  status: 'ACTIVE' | 'DISPATCHED' | 'CONTAINED' | 'RESOLVED';
+  affectedRoads?: string[];
+  estimatedImpact?: string;
+  unitsDispatched?: number;
+  evidenceSources?: string[];
+  reasoning?: string;
+  provenance?: DataProvenance;
+  connectionStatus?: ConnectionStatus;
+  
+  // Workflow Engine Extensions
+  workflowStage?: WorkflowStage;
+  bufferRadiusMeters?: number; // e.g. 100, 250, 500, 1000
+  escalationRisk?: 'LOW' | 'MODERATE' | 'HIGH' | 'CRITICAL';
+  estimatedResolutionMin?: number;
+  timeline?: WorkflowTimelineEvent[];
+  agenciesWorkflow?: AgencyWorkflowStatus[];
+  resourceRecommendations?: ResourceRecommendation[];
+  contextData?: IncidentContextData;
+  analytics?: IncidentAnalytics;
+}
+
+export interface IntelligenceItem {
+  id: string;
+  publisherName: string;
+  publisherLogo?: string;
+  /** Display string, e.g. '14:32' or '12 mins ago'. Not orderable. */
+  publishedTime: string;
+  /**
+   * ISO 8601 publication moment, when the upstream feed supplied one.
+   *
+   * Separate from `publishedTime` because that field is formatted for reading and
+   * has lost the date. Null or absent means the feed did not say when this was
+   * published — which must not be read as "just now".
+   */
+  publishedAt?: string | null;
+  headline: string;
+  summary: string;
+  url: string;
+  source: 'GOOGLE_NEWS' | 'GOVT_ADVISORY' | 'WEATHER_BULLETIN' | 'TRAFFIC_FEED';
+  category: string;
+  content?: string;
+  highlights?: string[];
+  classification?: string;
+}
+
+/**
+ * A *pool* summary — how many of a class of asset exist and how many are free.
+ *
+ * Note this is not an individual vehicle: it cannot be dispatched, located or
+ * assigned. Pool counts are derived from `FieldUnit` records by the store, so
+ * the strip on the dashboard and the roster on the tracker can never disagree.
+ */
+export interface ResourceUnit {
+  id: string;
+  name: string;
+  type: ResourceClass;
+  total: number;
+  available: number;
+  dispatched: number;
+  maintenance: number;
+}
+
+export type ResourceClass =
+  | 'Fire Engines'
+  | 'Police Vehicles'
+  | 'Ambulances'
+  | 'Response Teams'
+  | 'Drone Units';
+
+/**
+ * Operational status of a single field asset.
+ *
+ * Ordered as the response lifecycle runs, which is also the order the tracker
+ * presents them in.
+ */
+export type FieldUnitStatus =
+  | 'AVAILABLE'
+  | 'ASSIGNED'
+  | 'EN_ROUTE'
+  | 'ACTIVE'
+  | 'RETURNING'
+  | 'OFFLINE';
+
+/**
+ * One dispatchable asset: a specific ambulance, tender, PCR van or team.
+ *
+ * `position` is deliberately nullable and separate from `homeBase`. ARKA has no
+ * vehicle-telematics feed, so for every unit in the committed roster the live
+ * position is genuinely unknown — and that must render as unknown rather than
+ * as the depot it is garaged at. A unit only gains a `position` when a telemetry
+ * source actually reports one.
+ */
+export interface FieldUnit {
+  id: string;
+  /** Radio callsign, if the agency publishes one. */
+  callsign: string;
+  name: string;
+  type: ResourceClass;
+  /** Owning agency, matched against `Agency.shortName` where possible. */
+  agency: string;
+  status: FieldUnitStatus;
+  /** Named station or depot this unit belongs to. Reference data, not a reading. */
+  homeBase: string;
+  /** Last reported position. Null when no telemetry source reports this unit. */
+  position: { lat: number; lng: number } | null;
+  /** Incident currently assigned, if any. Authoritative field is the store's assignment table. */
+  assignedIncidentId: string | null;
+  /** ISO 8601 of the last status change ARKA is aware of. */
+  lastUpdated: string;
+  /** Crew size, where the roster records one. */
+  crew: number | null;
+  /** Free-text capability tags used to match a unit to an incident category. */
+  capabilities: string[];
+}
+
+export interface DroneUnit {
+  id: string;
+  callsign: string;
+  battery: number;
+  altMeters: number;
+  speedKmh: number;
+  lat: number;
+  lng: number;
+  targetArea: string;
+  status: 'PATROLLING' | 'DISPATCHED' | 'HOVERING' | 'CHARGING';
+  streamUrl?: string;
+}
+
+export interface LandmarkNode {
+  id: string;
+  name: string;
+  type: 'HOSPITAL' | 'POLICE' | 'FIRE' | 'POWER' | 'WATER' | 'TELECOM' | 'AIRPORT' | 'STATION' | 'GOVT' | 'UNIVERSITY';
+  lat: number;
+  lng: number;
+  status: 'OPERATIONAL' | 'ALERT' | 'MAINTENANCE';
+  details: string;
+}
+
+export interface MapLayersState {
+  traffic: boolean;
+  incidents: boolean;
+  weather: boolean;
+  utilities: boolean;
+  cameras: boolean;
+  drones: boolean;
+  hospitals: boolean;
+  police: boolean;
+  fire: boolean;
+  buildings3D: boolean;
+  satellite: boolean;
+  infrastructure?: boolean;
+  floodZones?: boolean;
+  heatmaps?: boolean;
+  /**
+   * Utility and civic layers the shell already initialises but which had no
+   * declaration, so `layersState` was silently rejecting them. Optional because
+   * not every map surface offers all of them.
+   */
+  schools?: boolean;
+  telecom?: boolean;
+  power?: boolean;
+  water?: boolean;
+  basemapStyle?: BasemapStyle;
+}
+
+export type BasemapStyle = 'dark' | 'satellite' | 'street' | 'terrain' | 'hybrid' | 'night';
+
+export type LayerId =
+  | 'traffic'
+  | 'incidents'
+  | 'weather'
+  | 'utilities'
+  | 'cameras'
+  | 'drones'
+  | 'hospitals'
+  | 'police'
+  | 'fire'
+  | 'buildings3D'
+  | 'satellite';
+
+export interface CameraNode {
+  id: string;
+  name: string;
+  locationName: string;
+  lat: number;
+  lng: number;
+  status: 'ONLINE' | 'ALERT' | 'OFFLINE';
+  direction: string;
+  fovAngle: number;
+  model: string; // e.g., 'YOLOv9 + DeepSORT'
+  detectedVehicles: number;
+  detectedPedestrians: number;
+  anomaliesDetected: number;
+  lastUpdate: string;
+  streamUrl?: string;
+  thumbnailUrl?: string;
+  clusterGroup?: string;
+}
+
+export interface HospitalNode {
+  id: string;
+  name: string;
+  type: 'GOVERNMENT' | 'PRIVATE' | 'EMERGENCY_CENTER';
+  lat: number;
+  lng: number;
+  address: string;
+  totalBeds: number;
+  availableBeds: number;
+  availableICU: number;
+  traumaLevel: 'LEVEL_1' | 'LEVEL_2' | 'LEVEL_3';
+  contact: string;
+  status: 'OPERATIONAL' | 'FULL' | 'DIVERTING';
+  nearestIncidentDistanceKm?: number;
+  estimatedEtaMins?: number;
+}
+
+export interface PoliceNode {
+  id: string;
+  name: string;
+  unitCallsign?: string;
+  type: 'STATION' | 'PATROL_UNIT' | 'PCR_VAN' | 'INTERCEPTOR';
+  lat: number;
+  lng: number;
+  sector: string;
+  personnelCount: number;
+  status: 'AVAILABLE' | 'DISPATCHED' | 'PATROLLING' | 'BUSY';
+  contact: string;
+  etaToIncidentMins?: number;
+}
+
+export interface FireNode {
+  id: string;
+  name: string;
+  type: 'STATION' | 'WATER_TENDER' | 'HYDRANT_NODE';
+  lat: number;
+  lng: number;
+  address: string;
+  tendersAvailable: number;
+  foamCapacityLiters: number;
+  hydrantsCount: number;
+  coverageRadiusKm: number;
+  status: 'READY' | 'DEPLOYED' | 'MAINTENANCE';
+  contact: string;
+}
+
+export interface UtilityNode {
+  id: string;
+  name: string;
+  type: 'POWER_SUBSTATION' | 'WATER_PUMP' | 'GAS_PIPELINE' | 'STREET_LIGHT_GRID' | 'TELECOM_TOWER' | 'SMART_METER_HUB';
+  lat: number;
+  lng: number;
+  gridZone: string;
+  capacityMetric: string; // e.g. "132kV / 420 MW", "180 MLD"
+  currentLoadPct: number;
+  status: 'NORMAL' | 'WARNING' | 'CRITICAL_OUTAGE' | 'MAINTENANCE';
+  outageRiskScore: number;
+  aiAnomalyScore: number;
+}
+
+export interface LayerMetadata {
+  id: LayerId;
+  name: string;
+  category: 'INFRASTRUCTURE' | 'EMERGENCY' | 'OPERATIONS' | 'BASEMAP' | 'ENVIRONMENT';
+  icon: string;
+  description: string;
+  algorithms: string[];
+  updateIntervalSec: number;
+  entityCount: number;
+  dataSizeKb: number;
+  backendEndpoint: string;
+  wsChannel: string;
+}
+
+export interface WeatherData {
+  temperature: number;
+  condition: string;
+  humidity: number;
+  visibility: number;
+  windSpeed: number;
+  windDirection: string;
+  rainIntensity: number;
+  floodRiskLevel: 'LOW' | 'MODERATE' | 'HIGH' | 'CRITICAL';
+  forecast: string;
+  provenance?: DataProvenance;
+  connectionStatus?: ConnectionStatus;
+}
+
+export interface LiveLog {
+  id: string;
+  timestamp: string;
+  message: string;
+  type: 'INFO' | 'WARN' | 'ALERT' | 'SUCCESS';
+}
+
+export interface TrafficCorridor {
+  id: string;
+  name: string;
+  roadName: string;
+  /**
+   * The real named junctions this corridor runs between, in order.
+   *
+   * These are surveyed anchor points — rotaries, squares, flyover ramps — and are
+   * authoritative configuration. They are *not* drawable geometry: joining them
+   * directly draws a straight line across whatever lies in between.
+   */
+  waypoints: [number, number][];
+  /**
+   * Drawable geometry, produced by the routing engine from published road
+   * segments between consecutive `waypoints`.
+   *
+   * Empty until resolved. Nothing may populate this by interpolating, smoothing
+   * or connecting waypoints — if the road network cannot join two anchors, the
+   * corridor stays unresolved and is not drawn.
+   */
+  path: [number, number][];
+  /** Whether `path` holds real road geometry, and how completely. */
+  pathStatus: 'UNRESOLVED' | 'RESOLVING' | 'ROAD_NETWORK' | 'PARTIAL' | 'NO_ROUTE';
+  /** Road distance along `path`, in metres. Null until resolved. */
+  pathLengthM?: number | null;
+  /** Why resolution failed, for the operator. Set only on PARTIAL / NO_ROUTE. */
+  pathNote?: string;
+  avgSpeedKmh: number;
+  freeFlowSpeedKmh: number;
+  congestionLevel: 'CLEAR' | 'SLOW' | 'JAMMED' | 'SEVERE';
+  congestionScore: number;
+  vehicleCount: number;
+  trend: 'IMPROVING' | 'STABLE' | 'WORSENING';
+  activeIncidentId?: string;
+  updatedAt: string;
+}
+
+export interface TrafficSensor {
+  id: string;
+  name: string;
+  lat: number;
+  lng: number;
+  speed: number;
+  status: 'ONLINE' | 'ALERT' | 'OFFLINE';
+  vehicleRatePerMin: number;
+  corridorId: string;
+}
+
+export interface TrafficSummary {
+  cityAvgSpeedKmh: number;
+  cityFreeFlowAvgSpeedKmh: number;
+  activeBottlenecks: number;
+  totalVehiclesPerMin: number;
+  congestionTrend: 'IMPROVING' | 'STABLE' | 'WORSENING';
+  highestCongestionCorridor: string;
+}
+
+// OpenClaw Autonomous Operations Framework Types
+export type OpenClawAgentId =
+  | 'supervisor'
+  | 'gis'
+  | 'intelligence'
+  | 'traffic'
+  | 'disaster'
+  | 'infrastructure'
+  | 'reporting';
+
+export interface OpenClawAgentStatus {
+  id: OpenClawAgentId;
+  name: string;
+  role: string;
+  status: 'IDLE' | 'BUSY' | 'WAITING' | 'COMPLETED' | 'ERROR';
+  currentTask?: string;
+  iconName: string;
+}
+
+export interface OpenClawToolSchema {
+  name: string;
+  category: 'GIS' | 'INCIDENT' | 'TRAFFIC' | 'WEATHER' | 'INTELLIGENCE' | 'INFRASTRUCTURE' | 'ANALYTICS' | 'RESOURCE' | 'NOTIFICATION';
+  description: string;
+  inputSchema: Record<string, any>;
+  outputSchema: Record<string, any>;
+  requiresPermission: boolean;
+}
+
+export interface OpenClawWorkflowStep {
+  id: string;
+  agentId: OpenClawAgentId;
+  agentName: string;
+  toolName: string;
+  description: string;
+  status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'AWAITING_CONFIRMATION';
+  params?: Record<string, any>;
+  result?: any;
+  durationMs?: number;
+}
+
+export interface OpenClawExecutionResult {
+  executionId: string;
+  userPrompt: string;
+  timestamp: string;
+  supervisorPlan: string[];
+  steps: OpenClawWorkflowStep[];
+  agentStatuses: Record<OpenClawAgentId, OpenClawAgentStatus['status']>;
+  finalSummary: string;
+  recommendations: string[];
+  requiresConfirmation?: {
+    action: string;
+    details: string;
+  };
+  stateChanges?: {
+    targetLocation?: { lat: number; lng: number; name: string };
+    layersToEnable?: string[];
+    selectedIncidentId?: string;
+  };
+}
+
+

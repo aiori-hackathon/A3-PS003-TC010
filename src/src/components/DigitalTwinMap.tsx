@@ -1,0 +1,1846 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import L from 'leaflet';
+// Map stylesheet is bundled with the app rather than loaded from a CDN, so the
+// map still renders correctly when the operator is offline.
+import 'leaflet/dist/leaflet.css';
+import {
+  Incident,
+  LandmarkNode,
+  DroneUnit,
+  MapLayersState,
+  WeatherData,
+  Severity,
+  TrafficCorridor,
+  TrafficSensor,
+  TrafficSummary,
+  NavItem,
+  CameraNode,
+  HospitalNode,
+  PoliceNode,
+  FireNode,
+  UtilityNode,
+  BasemapStyle,
+} from '../types';
+import { operationalStore, useOperationalStore } from '../store/useOperationalStore';
+import { CentralLayerManager } from '../services/LayerManager';
+import { LayerControlToolbar } from './LayerControlToolbar';
+// Base GIS tier: the city's own authoritative geography, rendered into dedicated
+// Leaflet panes below every ARKA overlay. Kept behind the provider interface so
+// the map never names a city-specific service.
+import { BaseGISMapController } from '../services/gis/leafletGISAdapter';
+import { gisLayerRegistry } from '../services/gis/GISLayerRegistry';
+import { GIS_CATEGORY_LABEL } from '../services/gis/types';
+import { featureLabel as gisFeatureLabel } from '../services/gis/formatAttributes';
+import { useGISRegistry } from './gis/useGISRegistry';
+import { MapIntelligencePanel } from './gis/MapIntelligencePanel';
+import { GISLegend } from './gis/GISLegend';
+import { GISFeatureCard } from './gis/GISFeatureCard';
+import type { GISMapActions, GISSelection } from './gis/gisMapActions';
+// Routing tier: geometry comes from the road-network engine, ranking from the
+// intelligence layer, and this component only ever hands the result to the
+// renderer. Nothing below computes a route coordinate.
+import { LeafletRouteRenderer } from '../services/routing/leafletRouteRenderer';
+import type { RouteRenderEntry } from '../services/routing/leafletRouteRenderer';
+import { useCorridorGeometry } from './routing/useCorridorGeometry';
+import { useDispatchRoutes } from './routing/useDispatchRoutes';
+import type { DispatchRouteView } from './routing/useDispatchRoutes';
+import { RoutePanel } from './routing/RoutePanel';
+import {
+  Layers,
+  ZoomIn,
+  ZoomOut,
+  Compass,
+  RotateCw,
+  Maximize2,
+  Home,
+  Search,
+  Ruler,
+  Eye,
+  Activity,
+  Shield,
+  Flame,
+  Zap,
+  Radio,
+  Building2,
+  Navigation,
+  CloudRain,
+  SlidersHorizontal,
+  Box,
+  Car,
+  AlertTriangle,
+  TrendingUp,
+  TrendingDown,
+  RefreshCw,
+  Video,
+  HeartPulse,
+  Globe,
+  X,
+  Play,
+  CheckCircle,
+  Route as RouteIcon,
+} from 'lucide-react';
+
+interface DigitalTwinMapProps {
+  incidents: Incident[];
+  landmarks: LandmarkNode[];
+  drones: DroneUnit[];
+  layersState: MapLayersState;
+  setLayersState: React.Dispatch<React.SetStateAction<MapLayersState>>;
+  weather: WeatherData;
+  trafficCorridors?: TrafficCorridor[];
+  trafficSensors?: TrafficSensor[];
+  trafficSummary?: TrafficSummary;
+  activeTab?: NavItem;
+  onSelectIncident: (incident: Incident) => void;
+  selectedIncident: Incident | null;
+  onSelectLandmark: (landmark: LandmarkNode) => void;
+  onSelectDrone: (drone: DroneUnit) => void;
+  onSelectCorridor?: (corridor: TrafficCorridor) => void;
+  selectedCorridor?: TrafficCorridor | null;
+}
+
+export const DigitalTwinMap: React.FC<DigitalTwinMapProps> = ({
+  incidents,
+  landmarks,
+  drones,
+  layersState,
+  setLayersState,
+  weather,
+  trafficCorridors = [],
+  trafficSensors = [],
+  trafficSummary,
+  activeTab = 'Command Center',
+  onSelectIncident,
+  selectedIncident,
+  onSelectLandmark,
+  onSelectDrone,
+  onSelectCorridor,
+  selectedCorridor,
+}) => {
+  const mapContainerRef = useRef<HTMLDivElement>(null);
+  const mapInstanceRef = useRef<L.Map | null>(null);
+  const markersGroupRef = useRef<L.LayerGroup | null>(null);
+  const layerManager = CentralLayerManager.getInstance();
+
+  /**
+   * The active basemap tile layer.
+   *
+   * Tracked explicitly because base GIS raster layers are also `L.TileLayer`
+   * instances. Swapping the basemap has to remove this one specifically — a sweep
+   * over every tile layer on the map would silently delete whatever city GIS
+   * imagery the operator had switched on.
+   */
+  const basemapRef = useRef<L.TileLayer | null>(null);
+
+  // --- Base GIS tier ------------------------------------------------------
+  const gisControllerRef = useRef<BaseGISMapController | null>(null);
+  const gisViewportTimerRef = useRef<number | null>(null);
+  const gis = useGISRegistry();
+
+  const [gisPanelOpen, setGisPanelOpen] = useState(false);
+  const [gisLegendVisible, setGisLegendVisible] = useState(true);
+  const [gisLegendCollapsed, setGisLegendCollapsed] = useState(false);
+  const [gisSelection, setGisSelection] = useState<GISSelection | null>(null);
+  const [gisBasket, setGisBasket] = useState<GISSelection[]>([]);
+
+  // --- Routing tier -------------------------------------------------------
+  // The renderer owns its own Leaflet pane and layer group, so calculated routes
+  // are never caught by the marker group's `clearLayers()` sweep and never have to
+  // be redrawn just because a telemetry tick moved a sensor badge.
+  const routeRendererRef = useRef<LeafletRouteRenderer | null>(null);
+  const [routePanelOpen, setRoutePanelOpen] = useState(false);
+
+  // Mobility forces the corridor layer on: arriving at the mobility module with
+  // the traffic layer switched off would show an empty map on the one page whose
+  // whole subject is how the city is moving.
+  const trafficVisible = layersState.traffic || activeTab === 'Mobility';
+
+  /**
+   * Corridors with real road geometry resolved onto the published road network.
+   *
+   * The corridors handed in carry surveyed junction anchors, not a drawable line.
+   * This is where they become drawable — or stay undrawn, if the road network
+   * cannot join their anchors.
+   */
+  const corridorGeometry = useCorridorGeometry(trafficCorridors, trafficVisible);
+  const resolvedCorridors = corridorGeometry.corridors;
+
+  const dispatchRoutes = useDispatchRoutes({
+    selectedIncident,
+    incidents,
+    corridors: resolvedCorridors,
+    enabled: layersState.incidents,
+  });
+
+  const [searchQuery, setSearchQuery] = useState('');
+  const [is3DMode, setIs3DMode] = useState(false);
+  const [measuringMode, setMeasuringMode] = useState(false);
+  const [measuredDistance, setMeasuredDistance] = useState<number | null>(null);
+  const measurePointsRef = useRef<[number, number][]>([]);
+  const measurePolylineRef = useRef<L.Polyline | null>(null);
+  const measureMarkersRef = useRef<L.Marker[]>([]);
+  const measuringModeRef = useRef<boolean>(false);
+
+  // --- Auto Map Rotation Tier ----------------------------------------------
+  const [isAutoRotateEnabled, setIsAutoRotateEnabled] = useState(false);
+
+  const autoRotateEnabledRef = useRef(isAutoRotateEnabled);
+  autoRotateEnabledRef.current = isAutoRotateEnabled;
+
+  const rotationAngleRef = useRef(0);
+  const animFrameIdRef = useRef<number | null>(null);
+  const inactivityTimerRef = useRef<number | null>(null);
+  const isUserInteractingRef = useRef(false);
+
+  const is3DModeRef = useRef(is3DMode);
+  is3DModeRef.current = is3DMode;
+
+  // ResizeObserver to automatically notify Leaflet when container dimensions change
+  useEffect(() => {
+    if (!mapContainerRef.current) return;
+    const container = mapContainerRef.current;
+    const observer = new ResizeObserver(() => {
+      if (mapInstanceRef.current) {
+        mapInstanceRef.current.invalidateSize();
+      }
+    });
+    observer.observe(container);
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
+
+  const resetMapPaneTransform = () => {
+    const map = mapInstanceRef.current;
+    if (!map) return;
+    try {
+      const mapPane = map.getPanes().mapPane;
+      if (!mapPane) return;
+      const pos = L.DomUtil.getPosition(mapPane);
+      const x = pos ? pos.x : 0;
+      const y = pos ? pos.y : 0;
+      mapPane.style.transformOrigin = 'center center';
+      if (is3DModeRef.current) {
+        mapPane.style.transform = `translate3d(${x}px, ${y}px, 0px) perspective(1000px) rotateX(25deg) scale(1.38)`;
+      } else {
+        mapPane.style.transform = `translate3d(${x}px, ${y}px, 0px)`;
+      }
+    } catch {
+      // Ignore if pane destroyed during unmount
+    }
+  };
+
+  // Trigger Leaflet transform update & invalidateSize when toggling 3D perspective mode
+  useEffect(() => {
+    is3DModeRef.current = is3DMode;
+    resetMapPaneTransform();
+    if (mapInstanceRef.current) {
+      const timer = setTimeout(() => {
+        mapInstanceRef.current?.invalidateSize();
+      }, 350);
+      return () => clearTimeout(timer);
+    }
+  }, [is3DMode]);
+
+  // Continuous Auto-Rotation Animation Effect (native single-axis mapPane transform)
+  useEffect(() => {
+    autoRotateEnabledRef.current = isAutoRotateEnabled;
+
+    if (!isAutoRotateEnabled) {
+      if (animFrameIdRef.current !== null) {
+        cancelAnimationFrame(animFrameIdRef.current);
+        animFrameIdRef.current = null;
+      }
+      if (inactivityTimerRef.current !== null) {
+        window.clearTimeout(inactivityTimerRef.current);
+        inactivityTimerRef.current = null;
+      }
+      isUserInteractingRef.current = false;
+      rotationAngleRef.current = 0;
+      resetMapPaneTransform();
+      return;
+    }
+
+    const animate = () => {
+      const map = mapInstanceRef.current;
+      if (autoRotateEnabledRef.current && map) {
+        if (!isUserInteractingRef.current) {
+          rotationAngleRef.current = (rotationAngleRef.current + 0.005) % 360;
+        }
+        try {
+          const mapPane = map.getPanes().mapPane;
+          if (mapPane) {
+            const pos = L.DomUtil.getPosition(mapPane);
+            const x = pos ? pos.x : 0;
+            const y = pos ? pos.y : 0;
+            const angle = rotationAngleRef.current;
+            mapPane.style.transformOrigin = 'center center';
+            if (is3DModeRef.current) {
+              mapPane.style.transform = `translate3d(${x}px, ${y}px, 0px) perspective(1000px) rotateX(25deg) rotateZ(${angle}deg) scale(1.42)`;
+            } else if (angle !== 0) {
+              mapPane.style.transform = `translate3d(${x}px, ${y}px, 0px) rotateZ(${angle}deg) scale(1.42)`;
+            } else {
+              mapPane.style.transform = `translate3d(${x}px, ${y}px, 0px)`;
+            }
+          }
+        } catch {
+          // Ignore if map unmounted
+        }
+      }
+      animFrameIdRef.current = requestAnimationFrame(animate);
+    };
+
+    animFrameIdRef.current = requestAnimationFrame(animate);
+
+    return () => {
+      if (animFrameIdRef.current !== null) {
+        cancelAnimationFrame(animFrameIdRef.current);
+        animFrameIdRef.current = null;
+      }
+      if (inactivityTimerRef.current !== null) {
+        window.clearTimeout(inactivityTimerRef.current);
+        inactivityTimerRef.current = null;
+      }
+      resetMapPaneTransform();
+    };
+  }, [isAutoRotateEnabled]);
+
+  // Active Selected Entity Modals
+  const [selectedCamera, setSelectedCamera] = useState<CameraNode | null>(null);
+  const [selectedHospital, setSelectedHospital] = useState<HospitalNode | null>(null);
+  const [selectedPolice, setSelectedPolice] = useState<PoliceNode | null>(null);
+  const [selectedFire, setSelectedFire] = useState<FireNode | null>(null);
+  const [selectedUtility, setSelectedUtility] = useState<UtilityNode | null>(null);
+
+  // Sync measuringMode ref & cursor style
+  useEffect(() => {
+    measuringModeRef.current = measuringMode;
+    if (mapContainerRef.current) {
+      mapContainerRef.current.style.cursor = measuringMode ? 'crosshair' : '';
+    }
+    if (!measuringMode) {
+      clearMeasurement();
+    }
+  }, [measuringMode]);
+
+  const clearMeasurement = () => {
+    measurePointsRef.current = [];
+    if (measurePolylineRef.current && mapInstanceRef.current) {
+      mapInstanceRef.current.removeLayer(measurePolylineRef.current);
+      measurePolylineRef.current = null;
+    }
+    measureMarkersRef.current.forEach((m) => {
+      if (mapInstanceRef.current) {
+        mapInstanceRef.current.removeLayer(m);
+      }
+    });
+    measureMarkersRef.current = [];
+    setMeasuredDistance(null);
+  };
+
+  // Initialize Leaflet Map
+  useEffect(() => {
+    if (!mapContainerRef.current || mapInstanceRef.current) return;
+
+    // Bhubaneswar center: 20.2961, 85.8245
+    const map = L.map(mapContainerRef.current, {
+      center: [20.2961, 85.8245],
+      zoom: 13,
+      zoomControl: false,
+      attributionControl: false,
+      preferCanvas: true,
+      fadeAnimation: true,
+      zoomAnimation: true,
+      markerZoomAnimation: true,
+    });
+
+    mapInstanceRef.current = map;
+
+    // Tile Layer based on basemapStyle or satellite
+    const tileUrl = layersState.satellite
+      ? 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+      : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+
+    basemapRef.current = L.tileLayer(tileUrl, {
+      maxZoom: 19,
+      subdomains: 'abcd',
+      keepBuffer: 6,
+      updateWhenIdle: false,
+      updateInterval: 100,
+    }).addTo(map);
+
+    const markersGroup = L.layerGroup().addTo(map);
+    markersGroupRef.current = markersGroup;
+
+    // Mount the base GIS tier. Its panes sit between Leaflet's tile pane and
+    // overlay pane, so every ARKA marker, corridor and alert ring stays above the
+    // city's geography by construction rather than by draw order luck.
+    const gisController = new BaseGISMapController(map, gisLayerRegistry, {
+      onFeatureClick: (def, properties, geometry) => {
+        setGisSelection({
+          layerId: def.id,
+          layerLabel: def.label,
+          themeLabel: GIS_CATEGORY_LABEL[def.category],
+          title: gisFeatureLabel(def, properties),
+          // Resolved through the provider so the card, the popup and a query
+          // result all read the same fields the same way.
+          attributes: gisLayerRegistry.getProvider().describeFeature(def.id, properties),
+          properties,
+          geometry,
+          origin: 'map',
+          caveat: def.caveat ?? null,
+        });
+      },
+    });
+    gisControllerRef.current = gisController;
+    void gisController.sync();
+
+    // Mount the route renderer. Its pane sits above the overlay pane and below the
+    // marker pane, so a calculated route reads clearly over corridor lines and city
+    // GIS layers while every unit marker stays on top of it.
+    routeRendererRef.current = new LeafletRouteRenderer(map);
+
+    // Vector GIS layers are fetched per viewport, so a pan or zoom has to re-ask.
+    // Debounced: an operator dragging across the city would otherwise fire a
+    // request for every intermediate frame.
+    const scheduleGISViewportRefresh = () => {
+      if (gisViewportTimerRef.current !== null) window.clearTimeout(gisViewportTimerRef.current);
+      gisViewportTimerRef.current = window.setTimeout(() => {
+        gisViewportTimerRef.current = null;
+        void gisControllerRef.current?.refreshViewport();
+      }, 150);
+    };
+    map.on('moveend', scheduleGISViewportRefresh);
+    map.on('zoomend', scheduleGISViewportRefresh);
+
+    // Auto Rotate Pause Listeners on User Interaction
+    const handleInteraction = () => {
+      if (autoRotateEnabledRef.current) {
+        isUserInteractingRef.current = true;
+        if (inactivityTimerRef.current !== null) {
+          window.clearTimeout(inactivityTimerRef.current);
+          inactivityTimerRef.current = null;
+        }
+        inactivityTimerRef.current = window.setTimeout(() => {
+          isUserInteractingRef.current = false;
+          inactivityTimerRef.current = null;
+        }, 12000);
+      }
+    };
+
+    map.on('movestart', handleInteraction);
+    map.on('zoomstart', handleInteraction);
+    map.on('dragstart', handleInteraction);
+    map.on('mousedown', handleInteraction);
+    map.on('touchstart', handleInteraction);
+    map.on('click', handleInteraction);
+
+    // Measurement Click Handler using Ref to avoid stale closure
+    map.on('click', (e: L.LeafletMouseEvent) => {
+      if (!measuringModeRef.current) return;
+      const { lat, lng } = e.latlng;
+      measurePointsRef.current.push([lat, lng]);
+
+      const ptCount = measurePointsRef.current.length;
+      let totalDist = 0;
+      for (let i = 1; i < measurePointsRef.current.length; i++) {
+        const p1 = L.latLng(measurePointsRef.current[i - 1]);
+        const p2 = L.latLng(measurePointsRef.current[i]);
+        totalDist += p1.distanceTo(p2);
+      }
+
+      const distLabel = ptCount === 1 ? 'Start Point' : `${(totalDist / 1000).toFixed(2)} km`;
+
+      const pinIcon = L.divIcon({
+        className: 'custom-measure-pin',
+        html: `<div class="w-5 h-5 rounded-full bg-[#F59E0B] text-black font-mono font-bold text-[10px] flex items-center justify-center border-2 border-black shadow-lg">${ptCount}</div>`,
+        iconSize: [20, 20],
+        iconAnchor: [10, 10],
+      });
+
+      const marker = L.marker([lat, lng], { icon: pinIcon })
+        .bindTooltip(distLabel, {
+          permanent: true,
+          direction: 'top',
+          className: 'bg-[#0A0A0A] border border-[#F59E0B] text-[#F59E0B] font-mono text-[10px] px-1.5 py-0.5 rounded shadow-xl font-bold',
+        })
+        .addTo(map);
+
+      measureMarkersRef.current.push(marker);
+
+      if (measurePolylineRef.current) {
+        measurePolylineRef.current.setLatLngs(measurePointsRef.current);
+      } else {
+        measurePolylineRef.current = L.polyline(measurePointsRef.current, {
+          color: '#F59E0B',
+          weight: 3,
+          dashArray: '6, 8',
+        }).addTo(map);
+      }
+
+      setMeasuredDistance(Math.round(totalDist));
+    });
+
+    return () => {
+      if (gisViewportTimerRef.current !== null) {
+        window.clearTimeout(gisViewportTimerRef.current);
+        gisViewportTimerRef.current = null;
+      }
+      gisControllerRef.current?.dispose();
+      gisControllerRef.current = null;
+      routeRendererRef.current?.dispose();
+      routeRendererRef.current = null;
+      basemapRef.current = null;
+      map.remove();
+      mapInstanceRef.current = null;
+    };
+  }, []);
+
+  // Update Basemap Tiles when satellite or basemapStyle changes
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    if (!map) return;
+
+    // Remove only the tracked basemap. Base GIS raster layers are `L.TileLayer`
+    // instances too, living in the GIS raster pane, so sweeping every tile layer
+    // off the map would delete the operator's active city GIS imagery along with
+    // the backdrop.
+    if (basemapRef.current) {
+      map.removeLayer(basemapRef.current);
+      basemapRef.current = null;
+    }
+
+    const style = layersState.basemapStyle || (layersState.satellite ? 'satellite' : 'dark');
+    let url = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+
+    if (style === 'satellite' || style === 'hybrid') {
+      url = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+    } else if (style === 'street') {
+      url = 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png';
+    } else if (style === 'terrain') {
+      url = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{z}/{y}/{x}';
+    } else if (style === 'night') {
+      url = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+    }
+
+    basemapRef.current = L.tileLayer(url, {
+      maxZoom: 19,
+      subdomains: 'abcd',
+      keepBuffer: 6,
+      updateWhenIdle: false,
+      updateInterval: 100,
+    }).addTo(map);
+
+    // The new backdrop is added last, so re-assert the GIS pane stack.
+    gisControllerRef.current?.refreshPanes();
+    routeRendererRef.current?.refreshPane();
+  }, [layersState.satellite, layersState.basemapStyle]);
+
+  /**
+   * What the map is actually asked to draw: the visible base GIS layers and their
+   * opacities, as a stable string.
+   *
+   * Deliberately not the whole runtime record. Source-state reporting —
+   * `loading`, `connected`, `unavailable` — flows through the same registry, and
+   * keying reconciliation off it would make a failed layer refetch forever: the
+   * error notification would trigger a sync, the sync would retry, and the retry
+   * would fail again. Requests are driven by what the operator asked to see, not
+   * by how the last request turned out.
+   */
+  const gisSyncKey = useMemo(
+    () =>
+      gis.layers
+        .filter((layer) => gis.runtime[layer.id]?.visible)
+        .map((layer) => `${layer.id}@${gis.runtime[layer.id]?.opacity ?? layer.defaultOpacity}`)
+        .join('|'),
+    [gis.layers, gis.runtime],
+  );
+
+  // Reconcile the map whenever the requested set of base GIS layers changes.
+  // `sync()` is additionally guarded by a per-layer signature, so a layer already
+  // drawn for this viewport is not refetched.
+  useEffect(() => {
+    void gisControllerRef.current?.sync();
+  }, [gisSyncKey]);
+
+
+  // Smoothly fly and center map to selected incident position when selectedIncident changes
+  useEffect(() => {
+    if (selectedIncident && mapInstanceRef.current) {
+      mapInstanceRef.current.flyTo(
+        [selectedIncident.location.lat, selectedIncident.location.lng],
+        16,
+        { animate: true, duration: 1.5 }
+      );
+    }
+  }, [selectedIncident]);
+
+  /**
+   * Draw the calculated routes.
+   *
+   * Deliberately its own effect. The marker engine below begins with
+   * `group.clearLayers()`, so anything drawn there is thrown away and rebuilt on
+   * every entity change; a route costs a network fetch and a graph search, and must
+   * not be tied to that cycle. This effect only ever hands the renderer what the
+   * routing engine returned — it draws nothing when there is nothing valid to draw,
+   * which is the correct appearance for NO VALID ROUTE AVAILABLE.
+   */
+  useEffect(() => {
+    const renderer = routeRendererRef.current;
+    if (!renderer) return;
+
+    const entries: RouteRenderEntry[] = [];
+    for (const route of dispatchRoutes.routes) {
+      const recommended = route.ranking?.recommended;
+      if (route.status !== 'VALID' || !recommended) continue;
+      entries.push({
+        key: route.key,
+        label: route.label,
+        ranked: recommended,
+        onClick: () => setRoutePanelOpen(true),
+      });
+    }
+
+    renderer.render(entries);
+  }, [dispatchRoutes.routes]);
+
+  /** Fit the map to a calculated route, using the geometry the engine returned. */
+  const focusRoute = (route: DispatchRouteView) => {
+    const map = mapInstanceRef.current;
+    const coordinates = route.ranking?.recommended?.candidate.coordinates;
+    if (!map || !coordinates || coordinates.length < 2) return;
+    map.fitBounds(L.latLngBounds(coordinates.map(([lat, lng]) => L.latLng(lat, lng))), {
+      padding: [72, 72],
+      maxZoom: 17,
+    });
+  };
+
+  /**
+   * Which corridors have geometry worth redrawing.
+   *
+   * Keyed on resolution state rather than the corridor array itself: the traffic
+   * poll hands over a fresh array every few seconds, and rebuilding every marker on
+   * the map at that cadence would be a regression. This changes only when a
+   * corridor actually gains or loses road geometry.
+   */
+  const corridorGeometryKey = useMemo(
+    () => resolvedCorridors.map((c) => `${c.id}:${c.pathStatus}:${c.path.length}`).join('|'),
+    [resolvedCorridors],
+  );
+
+  // Comprehensive Entity Rendering Engine for ALL 11 Layers
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    const group = markersGroupRef.current;
+    if (!map || !group) return;
+
+    group.clearLayers();
+
+    // ----------------------------------------------------------------------
+    // LAYER 1 — TRAFFIC (Polylines, IoT Speed Sensors, Flow Vectors)
+    // ----------------------------------------------------------------------
+    if (trafficVisible) {
+      resolvedCorridors.forEach((corridor) => {
+        // A corridor is drawn only once the routing engine has joined its surveyed
+        // junction anchors along published road segments. Until then there is no
+        // honest line to draw, so none is drawn — the old behaviour of connecting
+        // the anchors directly is what put corridors through buildings and water.
+        if (corridor.pathStatus !== 'ROAD_NETWORK' || corridor.path.length < 2) return;
+
+        let color = '#10B981'; // CLEAR
+        let weight = 4;
+        let dashArray: string | undefined = undefined;
+
+        if (corridor.congestionLevel === 'SEVERE') {
+          color = '#EF4444';
+          weight = 7;
+          dashArray = '8, 6';
+        } else if (corridor.congestionLevel === 'JAMMED') {
+          color = '#EF4444';
+          weight = 6;
+        } else if (corridor.congestionLevel === 'SLOW') {
+          color = '#F59E0B';
+          weight = 5;
+        }
+
+        const isSelected = selectedCorridor?.id === corridor.id;
+
+        const poly = L.polyline(corridor.path, {
+          color: isSelected ? '#06B6D4' : color,
+          weight: isSelected ? weight + 3 : weight,
+          opacity: isSelected ? 1 : 0.85,
+          dashArray,
+        }).addTo(group);
+
+        poly.bindTooltip(
+          `
+          <div class="font-mono text-[10px] p-1.5 bg-[#0A0A0A] text-white border border-white/20 rounded shadow-xl">
+            <div class="font-bold text-[#06B6D4] uppercase">${corridor.name}</div>
+            <div class="text-white/60 text-[9px]">${corridor.roadName}</div>
+            <div class="mt-1 flex justify-between space-x-3">
+              <span>SPEED: <strong style="color: ${color}">${corridor.avgSpeedKmh} km/h</strong></span>
+              <span class="text-white/40">FREEFLOW: ${corridor.freeFlowSpeedKmh} km/h</span>
+            </div>
+            <div class="flex justify-between text-[9px] mt-0.5">
+              <span>CONGESTION: <strong style="color: ${color}">${corridor.congestionLevel} (${corridor.congestionScore}%)</strong></span>
+            </div>
+            <div class="text-white/35 text-[9px] mt-0.5">GEOMETRY: ${corridor.path.length} ROAD VERTICES${
+              corridor.pathLengthM ? ` · ${(corridor.pathLengthM / 1000).toFixed(2)} KM BY ROAD` : ''
+            }</div>
+          </div>
+          `,
+          { sticky: true, opacity: 0.95 }
+        );
+
+        if (onSelectCorridor) {
+          poly.on('click', () => onSelectCorridor(corridor));
+        }
+      });
+
+      // Render Traffic Radar Sensors
+      trafficSensors.forEach((sensor) => {
+        const isSpeedSlow = sensor.speed < 20;
+        const badgeColor = isSpeedSlow
+          ? 'bg-[#EF4444] text-white animate-pulse'
+          : sensor.speed < 35
+          ? 'bg-[#F59E0B] text-black'
+          : 'bg-[#10B981] text-black';
+
+        const sensorIcon = L.divIcon({
+          className: 'custom-traffic-sensor-marker',
+          html: `
+            <div class="relative flex items-center space-x-1 cursor-pointer transform hover:scale-125 transition-transform bg-[#0A0A0A]/90 border border-white/20 px-1.5 py-0.5 rounded shadow-lg font-mono text-[9px]">
+              <span class="w-2 h-2 rounded-full ${sensor.status === 'ALERT' ? 'bg-[#EF4444] animate-ping' : 'bg-[#10B981]'}"></span>
+              <span class="text-white/70 font-bold">${sensor.id}</span>
+              <span class="px-1 rounded text-[8px] font-bold ${badgeColor}">${sensor.speed}k</span>
+            </div>
+          `,
+          iconSize: [60, 20],
+          iconAnchor: [30, 10],
+        });
+
+        const sensorMarker = L.marker([sensor.lat, sensor.lng], { icon: sensorIcon });
+        sensorMarker.bindTooltip(
+          `
+          <div class="font-mono text-[10px] bg-[#0A0A0A] text-white p-1.5 border border-white/20 rounded">
+            <div class="font-bold text-[#06B6D4]">${sensor.id} - ${sensor.name}</div>
+            <div class="text-white/70">RADAR SPEED: <strong class="text-white">${sensor.speed} km/h</strong></div>
+            <div class="text-white/70">FLOW RATE: <strong class="text-[#10B981]">${sensor.vehicleRatePerMin} veh/min</strong></div>
+          </div>
+          `,
+          { sticky: true }
+        );
+        sensorMarker.addTo(group);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // LAYER 2 — INCIDENTS (Pulsing emergency markers)
+    // ----------------------------------------------------------------------
+    if (layersState.incidents) {
+      incidents.forEach((inc) => {
+        const isSelected = selectedIncident?.id === inc.id;
+        const colorClass =
+          inc.priority === 'CRITICAL'
+            ? 'bg-red-500 border-red-300 text-red-100 shadow-[0_0_15px_#ef4444]'
+            : inc.priority === 'HIGH'
+            ? 'bg-amber-500 border-amber-300 text-amber-100 shadow-[0_0_12px_#f59e0b]'
+            : inc.priority === 'MEDIUM'
+            ? 'bg-yellow-500 border-yellow-200 text-yellow-950'
+            : 'bg-emerald-500 border-emerald-300 text-emerald-950';
+
+        const ringHighlight = isSelected
+          ? '<span class="absolute inline-flex h-14 w-14 rounded-full border-2 border-[#06B6D4] animate-ping opacity-90"></span><span class="absolute inline-flex h-10 w-10 rounded-full bg-[#06B6D4]/30 border border-[#06B6D4]"></span>'
+          : '';
+
+        const customIcon = L.divIcon({
+          className: 'custom-incident-marker',
+          html: `
+            <div class="relative flex items-center justify-center cursor-pointer transform hover:scale-125 transition-transform">
+              ${ringHighlight}
+              <span class="absolute inline-flex h-8 w-8 rounded-full ${
+                inc.priority === 'CRITICAL' ? 'bg-red-500 animate-ping opacity-75' : 'bg-amber-500 animate-pulse opacity-50'
+              }"></span>
+              <div class="relative w-6 h-6 rounded-full border-2 flex items-center justify-center text-[10px] font-mono font-bold ${colorClass}">
+                ${inc.category[0]}
+              </div>
+            </div>
+          `,
+          iconSize: [24, 24],
+          iconAnchor: [12, 12],
+        });
+
+        const marker = L.marker([inc.location.lat, inc.location.lng], { icon: customIcon });
+
+        if (isSelected) {
+          const bufferRadius = inc.bufferRadiusMeters || 500;
+          const bufferCircle = L.circle([inc.location.lat, inc.location.lng], {
+            radius: bufferRadius,
+            color: '#3B82F6',
+            weight: 2,
+            dashArray: '6, 6',
+            fillColor: '#3B82F6',
+            fillOpacity: 0.15,
+          }).addTo(group);
+
+          bufferCircle.bindTooltip(
+            `<div class="font-mono text-[10px] bg-[#090D16] text-[#60A5FA] px-2 py-1 border border-blue-500/40 rounded">
+              ⚡ EOC RESPONSE PERIMETER (${bufferRadius}m RADIUS)
+            </div>`,
+            { sticky: true }
+          );
+
+          // Dispatch geometry is not drawn here. It used to be a hardcoded
+          // four-point ladder ending at the incident, which drew a line across
+          // whatever lay between. Routes are now calculated by the road-network
+          // engine and drawn by `LeafletRouteRenderer` in its own pane.
+
+          marker.bindTooltip(
+            `
+            <div class="font-mono text-[10px] bg-[#0A0A0A] text-white p-2 border border-[#06B6D4] rounded shadow-2xl">
+              <div class="font-bold text-[#06B6D4] uppercase">TARGET INCIDENT #${inc.id}</div>
+              <div class="font-bold text-white text-xs">${inc.title}</div>
+              <div class="text-white/70 mt-0.5">${inc.location.name}</div>
+              <div class="mt-1 flex items-center justify-between text-[9px]">
+                <span class="text-red-400 font-bold">${inc.priority}</span>
+                <span class="text-emerald-400 font-bold">${inc.workflowStage || inc.status}</span>
+              </div>
+            </div>
+            `,
+            { permanent: true, direction: 'top', className: 'bg-transparent border-0 p-0 shadow-none' }
+          );
+        }
+
+        marker.on('click', () => onSelectIncident(inc));
+        marker.addTo(group);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // LAYER 3 — WEATHER (IMD Doppler Radar & Flood Risk Circle Overlay)
+    // ----------------------------------------------------------------------
+    if (layersState.weather) {
+      // Primary Doppler Radar Circle around Jayadev Vihar/Patia
+      const weatherRadarCircle = L.circle([20.3150, 85.8250], {
+        radius: 3500,
+        color: '#06B6D4',
+        weight: 1.5,
+        dashArray: '4, 4',
+        fillColor: '#06B6D4',
+        fillOpacity: 0.15,
+      }).addTo(group);
+
+      weatherRadarCircle.bindTooltip(
+        `
+        <div class="font-mono text-[10px] bg-[#0A0A0A] text-white p-1.5 border border-[#06B6D4]/40 rounded">
+          <div class="font-bold text-[#06B6D4] uppercase">IMD Doppler Weather Radar Grid</div>
+          <div>RAIN INTENSITY: <strong class="text-white">${weather.rainIntensity} mm/hr</strong></div>
+          <div>FLOOD RISK LEVEL: <strong class="text-yellow-400">${weather.floodRiskLevel}</strong></div>
+          <div class="text-white/50 text-[9px] mt-0.5">${weather.forecast}</div>
+        </div>
+        `,
+        { sticky: true }
+      );
+
+      // Core Inundation Risk Polygon
+      L.polygon(
+        [
+          [20.3080, 85.8200],
+          [20.3050, 85.8300],
+          [20.2980, 85.8280],
+          [20.3000, 85.8180],
+        ],
+        {
+          color: '#EF4444',
+          weight: 2,
+          fillColor: '#EF4444',
+          fillOpacity: 0.2,
+        }
+      ).addTo(group);
+    }
+
+    // ----------------------------------------------------------------------
+    // LAYER 4 — UTILITIES (Power Sub-stations, Water Lines, FiberPOP Grid)
+    // ----------------------------------------------------------------------
+    if (layersState.utilities) {
+      const utilityNodes = layerManager.getUtilities();
+
+      utilityNodes.forEach((u) => {
+        const isOutage = u.status === 'CRITICAL_OUTAGE';
+        const isWarning = u.status === 'WARNING';
+        const colorClass = isOutage
+          ? 'bg-red-500 text-white animate-pulse border-red-300'
+          : isWarning
+          ? 'bg-amber-500 text-black border-amber-300'
+          : 'bg-yellow-400 text-black border-yellow-200';
+
+        const iconSymbol =
+          u.type === 'POWER_SUBSTATION'
+            ? '⚡'
+            : u.type === 'WATER_PUMP'
+            ? '💧'
+            : u.type === 'GAS_PIPELINE'
+            ? '🔥'
+            : '📡';
+
+        const icon = L.divIcon({
+          className: 'custom-utility-marker',
+          html: `
+            <div class="w-6 h-6 rounded-md border flex items-center justify-center text-xs shadow-lg ${colorClass} hover:scale-125 transition-transform cursor-pointer">
+              <span>${iconSymbol}</span>
+            </div>
+          `,
+          iconSize: [24, 24],
+          iconAnchor: [12, 12],
+        });
+
+        const marker = L.marker([u.lat, u.lng], { icon });
+        marker.on('click', () => setSelectedUtility(u));
+        marker.bindTooltip(
+          `
+          <div class="font-mono text-[10px] bg-[#0A0A0A] text-white p-1.5 border border-yellow-500/40 rounded">
+            <div class="font-bold text-yellow-400 uppercase">${u.name}</div>
+            <div>LOAD: <strong class="text-white">${u.currentLoadPct}%</strong> (${u.capacityMetric})</div>
+            <div>STATUS: <strong class="${isOutage ? 'text-red-400' : 'text-emerald-400'}">${u.status}</strong></div>
+          </div>
+          `,
+          { sticky: true }
+        );
+        marker.addTo(group);
+      });
+
+      // Render Power Grid Connecting Line
+      const powerLineCoords: [number, number][] = [
+        [20.2800, 85.8380], // Central Substation
+        [20.3450, 85.8120], // Patia Substation
+      ];
+      L.polyline(powerLineCoords, {
+        color: '#EAB308',
+        weight: 2,
+        dashArray: '6, 6',
+        opacity: 0.7,
+      }).addTo(group);
+    }
+
+    // ----------------------------------------------------------------------
+    // LAYER 5 — CAMERAS (CCTV Radar & ANPR Telemetry Nodes)
+    // ----------------------------------------------------------------------
+    if (layersState.cameras) {
+      const cameraNodes = layerManager.getCameras();
+
+      cameraNodes.forEach((cam) => {
+        const isAlert = cam.status === 'ALERT';
+        const icon = L.divIcon({
+          className: 'custom-camera-marker',
+          html: `
+            <div class="relative flex items-center justify-center cursor-pointer transform hover:scale-125 transition-transform">
+              <div class="w-7 h-7 rounded-md bg-[#0A0A0A] border ${
+                isAlert ? 'border-red-500 text-red-400 shadow-[0_0_10px_#ef4444]' : 'border-indigo-400 text-indigo-400 shadow-[0_0_10px_#6366f1]'
+              } flex items-center justify-center">
+                <span class="text-[10px]">🎥</span>
+              </div>
+              <span class="absolute -top-1 -right-1 px-1 rounded-full bg-[#06B6D4] text-black font-mono font-bold text-[7px]">
+                ${cam.detectedVehicles}
+              </span>
+            </div>
+          `,
+          iconSize: [28, 28],
+          iconAnchor: [14, 14],
+        });
+
+        const marker = L.marker([cam.lat, cam.lng], { icon });
+        marker.on('click', () => setSelectedCamera(cam));
+        marker.bindTooltip(
+          `
+          <div class="font-mono text-[10px] bg-[#0A0A0A] text-white p-1.5 border border-indigo-500/40 rounded">
+            <div class="font-bold text-indigo-400 uppercase">${cam.name}</div>
+            <div class="text-white/60">${cam.model}</div>
+            <div class="mt-1 flex justify-between space-x-2">
+              <span>VEHICLES: <strong class="text-white">${cam.detectedVehicles}</strong></span>
+              <span>PEDESTRIANS: <strong class="text-white">${cam.detectedPedestrians}</strong></span>
+            </div>
+            <div class="text-[9px] text-cyan-400 mt-0.5">Click to open Live CCTV Stream</div>
+          </div>
+          `,
+          { sticky: true }
+        );
+        marker.addTo(group);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // LAYER 6 — DRONES (Animated GARUDA UAV Aerial Units & Path Rings)
+    // ----------------------------------------------------------------------
+    if (layersState.drones) {
+      drones.forEach((d) => {
+        const droneIcon = L.divIcon({
+          className: 'custom-drone-marker',
+          html: `
+            <div class="relative flex items-center justify-center text-teal-400 hover:scale-125 transition-transform cursor-pointer">
+              <span class="absolute inline-flex h-8 w-8 rounded-full bg-teal-400/20 animate-ping"></span>
+              <div class="w-7 h-7 rounded-full bg-[#0A0A0A] border border-teal-400 flex items-center justify-center shadow-[0_0_12px_#14b8a6]">
+                <span class="text-[11px] font-mono font-bold">🛸</span>
+              </div>
+            </div>
+          `,
+          iconSize: [28, 28],
+          iconAnchor: [14, 14],
+        });
+
+        const marker = L.marker([d.lat, d.lng], { icon: droneIcon });
+        marker.on('click', () => onSelectDrone(d));
+
+        // Render 500m Coverage Radius Circle
+        L.circle([d.lat, d.lng], {
+          radius: 500,
+          color: '#14B8A6',
+          weight: 1,
+          dashArray: '3, 3',
+          fillOpacity: 0.05,
+        }).addTo(group);
+
+        marker.addTo(group);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // LAYER 7 — HOSPITALS (Apex Trauma Centers & Emergency Bed Telemetry)
+    // ----------------------------------------------------------------------
+    if (layersState.hospitals) {
+      const hospitalNodes = layerManager.getHospitals();
+
+      hospitalNodes.forEach((h) => {
+        const icon = L.divIcon({
+          className: 'custom-hospital-marker',
+          html: `
+            <div class="w-7 h-7 rounded-md bg-[#0A0A0A] border border-rose-500 text-rose-400 flex items-center justify-center shadow-[0_0_10px_#f43f5e] hover:scale-125 transition-transform cursor-pointer">
+              <span class="text-[12px]">🏥</span>
+            </div>
+          `,
+          iconSize: [28, 28],
+          iconAnchor: [14, 14],
+        });
+
+        const marker = L.marker([h.lat, h.lng], { icon });
+        marker.on('click', () => setSelectedHospital(h));
+        marker.bindTooltip(
+          `
+          <div class="font-mono text-[10px] bg-[#0A0A0A] text-white p-1.5 border border-rose-500/40 rounded">
+            <div class="font-bold text-rose-400 uppercase">${h.name}</div>
+            <div class="text-white/60">${h.type} | ${h.traumaLevel}</div>
+            <div class="mt-1 flex justify-between space-x-3">
+              <span>AVAILABLE BEDS: <strong class="text-emerald-400">${h.availableBeds}</strong></span>
+              <span>ICU: <strong class="text-cyan-400">${h.availableICU}</strong></span>
+            </div>
+          </div>
+          `,
+          { sticky: true }
+        );
+        marker.addTo(group);
+      });
+
+      // The casualty evacuation route is calculated against the road network and
+      // drawn by the route renderer. The nearest hospital is chosen there too, by
+      // road distance rather than by crow-fly: a straight line between two markers
+      // says nothing about whether an ambulance can drive it.
+    }
+
+    // ----------------------------------------------------------------------
+    // LAYER 8 — POLICE (Commissionerate HQ & PCR Patrol Vans)
+    // ----------------------------------------------------------------------
+    if (layersState.police) {
+      const policeNodes = layerManager.getPolice();
+
+      policeNodes.forEach((p) => {
+        const isStation = p.type === 'STATION';
+        const iconSymbol = isStation ? '👮' : '🚓';
+        const icon = L.divIcon({
+          className: 'custom-police-marker',
+          html: `
+            <div class="w-7 h-7 rounded-md bg-[#0A0A0A] border border-blue-500 text-blue-400 flex items-center justify-center shadow-[0_0_10px_#3b82f6] hover:scale-125 transition-transform cursor-pointer">
+              <span class="text-[12px]">${iconSymbol}</span>
+            </div>
+          `,
+          iconSize: [28, 28],
+          iconAnchor: [14, 14],
+        });
+
+        const marker = L.marker([p.lat, p.lng], { icon });
+        marker.on('click', () => setSelectedPolice(p));
+        marker.bindTooltip(
+          `
+          <div class="font-mono text-[10px] bg-[#0A0A0A] text-white p-1.5 border border-blue-500/40 rounded">
+            <div class="font-bold text-blue-400 uppercase">${p.name}</div>
+            <div class="text-white/60">SECTOR: ${p.sector} | STATUS: <strong class="text-emerald-400">${p.status}</strong></div>
+          </div>
+          `,
+          { sticky: true }
+        );
+        marker.addTo(group);
+      });
+
+      // The responder dispatch route is calculated against the road network and
+      // drawn by the route renderer, which also decides which patrol is actually
+      // nearest by road.
+    }
+
+    // ----------------------------------------------------------------------
+    // LAYER 9 — FIRE (Fire Stations, Tenders & 3km Coverage Radius Circles)
+    // ----------------------------------------------------------------------
+    if (layersState.fire) {
+      const fireNodes = layerManager.getFire();
+
+      fireNodes.forEach((f) => {
+        const icon = L.divIcon({
+          className: 'custom-fire-marker',
+          html: `
+            <div class="w-7 h-7 rounded-md bg-[#0A0A0A] border border-orange-500 text-orange-400 flex items-center justify-center shadow-[0_0_10px_#f97316] hover:scale-125 transition-transform cursor-pointer">
+              <span class="text-[12px]">🚒</span>
+            </div>
+          `,
+          iconSize: [28, 28],
+          iconAnchor: [14, 14],
+        });
+
+        const marker = L.marker([f.lat, f.lng], { icon });
+        marker.on('click', () => setSelectedFire(f));
+
+        if (f.coverageRadiusKm > 0) {
+          L.circle([f.lat, f.lng], {
+            radius: f.coverageRadiusKm * 1000,
+            color: '#F97316',
+            weight: 1,
+            dashArray: '5, 5',
+            fillOpacity: 0.04,
+          }).addTo(group);
+        }
+
+        marker.bindTooltip(
+          `
+          <div class="font-mono text-[10px] bg-[#0A0A0A] text-white p-1.5 border border-orange-500/40 rounded">
+            <div class="font-bold text-orange-400 uppercase">${f.name}</div>
+            <div class="text-white/60">TENDERS: <strong class="text-white">${f.tendersAvailable}</strong> | FOAM: ${f.foamCapacityLiters}L</div>
+          </div>
+          `,
+          { sticky: true }
+        );
+        marker.addTo(group);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // LAYER 10 — 3D EXTRUSIONS (3D Building Height Polygon Styling)
+    // ----------------------------------------------------------------------
+    if (layersState.buildings3D) {
+      const bldgPoints: [number, number][][] = [
+        // Secretariat Complex Polygon
+        [[20.2755, 85.833], [20.2755, 85.835], [20.2735, 85.835], [20.2735, 85.833]],
+        // BMC Corporate Tower
+        [[20.292, 85.844], [20.292, 85.846], [20.29, 85.846], [20.29, 85.844]],
+        // Master Canteen Station Plaza
+        [[20.2685, 85.8395], [20.2685, 85.841], [20.267, 85.841], [20.267, 85.8395]],
+        // Kalinga Stadium Main Arena
+        [[20.3010, 85.8200], [20.3010, 85.8230], [20.2980, 85.8230], [20.2980, 85.8200]],
+        // KIIT Infocity Tech Hub
+        [[20.3540, 85.8170], [20.3540, 85.8200], [20.3510, 85.8200], [20.3510, 85.8170]],
+      ];
+
+      bldgPoints.forEach((poly) => {
+        L.polygon(poly, {
+          color: '#FCD34D',
+          weight: 2,
+          fillColor: '#F59E0B',
+          fillOpacity: 0.35,
+        }).addTo(group);
+      });
+    }
+
+    // ----------------------------------------------------------------------
+    // INFRASTRUCTURE LANDMARKS
+    // ----------------------------------------------------------------------
+    landmarks.forEach((lm) => {
+      let shouldShow = false;
+      let symbol = '🏛️';
+      let iconColor = 'text-cyan-400 border-cyan-500/60 bg-slate-900';
+
+      if (lm.type === 'HOSPITAL' && layersState.hospitals) {
+        shouldShow = true;
+        symbol = '🏥';
+      } else if (lm.type === 'POLICE' && layersState.police) {
+        shouldShow = true;
+        symbol = '👮';
+      } else if (lm.type === 'FIRE' && layersState.fire) {
+        shouldShow = true;
+        symbol = '🚒';
+      } else if (layersState.infrastructure) {
+        shouldShow = true;
+      }
+
+      if (shouldShow) {
+        const icon = L.divIcon({
+          className: 'custom-landmark-marker',
+          html: `
+            <div class="w-6 h-6 rounded-md border flex items-center justify-center text-xs shadow-md ${iconColor} hover:scale-110 transition-transform">
+              <span>${symbol}</span>
+            </div>
+          `,
+          iconSize: [24, 24],
+          iconAnchor: [12, 12],
+        });
+
+        const marker = L.marker([lm.lat, lm.lng], { icon });
+        marker.on('click', () => onSelectLandmark(lm));
+        marker.addTo(group);
+      }
+    });
+
+    // `corridorGeometryKey` rather than the corridor array: this redraws when a
+    // corridor gains real road geometry, not on every five-second traffic poll.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // `trafficVisible` was missing here, so arriving on the mobility module never
+    // redrew the corridors it forces on — the layer only appeared after some other
+    // dependency happened to change.
+  }, [
+    incidents,
+    landmarks,
+    drones,
+    layersState,
+    selectedIncident,
+    selectedCorridor,
+    corridorGeometryKey,
+    trafficVisible,
+  ]);
+
+  // Handle Search Location in Bhubaneswar
+  const handleSearch = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!searchQuery.trim() || !mapInstanceRef.current) return;
+    const query = searchQuery.toLowerCase();
+
+    const matchedLandmark = landmarks.find((l) => l.name.toLowerCase().includes(query));
+    if (matchedLandmark) {
+      mapInstanceRef.current.flyTo([matchedLandmark.lat, matchedLandmark.lng], 16, { duration: 1.5 });
+      onSelectLandmark(matchedLandmark);
+      return;
+    }
+
+    const matchedIncident = incidents.find(
+      (i) => i.title.toLowerCase().includes(query) || i.location.name.toLowerCase().includes(query)
+    );
+    if (matchedIncident) {
+      mapInstanceRef.current.flyTo([matchedIncident.location.lat, matchedIncident.location.lng], 16, { duration: 1.5 });
+      onSelectIncident(matchedIncident);
+      return;
+    }
+  };
+
+  const resetHome = () => {
+    if (mapInstanceRef.current) {
+      mapInstanceRef.current.flyTo([20.2961, 85.8245], 13, { duration: 1.2 });
+    }
+  };
+
+  /**
+   * What the GIS panels are allowed to ask of the map.
+   *
+   * This is the whole of the click-to-display contract. Every panel action lands
+   * here and is carried out against the one live map instance — there is no path
+   * by which clicking a layer, a ward or a query result opens a second map, a
+   * static image or a separate page.
+   *
+   * Memoised with no dependencies because every call reads through a ref: the
+   * identity stays stable across renders, so the panels do not re-render on every
+   * map event.
+   */
+  const gisActions = useMemo<GISMapActions>(
+    () => ({
+      activateLayer: async (layerId: string) => {
+        await gisControllerRef.current?.activateLayer(layerId);
+      },
+
+      deactivateLayer: async (layerId: string) => {
+        await gisControllerRef.current?.deactivateLayer(layerId);
+      },
+
+      ensureLayer: async (layerId: string) => {
+        if (gisLayerRegistry.isVisible(layerId)) return;
+        gisLayerRegistry.setVisible(layerId, true);
+        await gisControllerRef.current?.sync();
+      },
+
+      toggleLayer: async (layerId: string) => {
+        const controller = gisControllerRef.current;
+        if (!controller) return;
+        if (gisLayerRegistry.isVisible(layerId)) await controller.deactivateLayer(layerId);
+        else await controller.activateLayer(layerId);
+      },
+
+      setCategoryVisible: async (category, visible: boolean) => {
+        const controller = gisControllerRef.current;
+        if (!controller) return;
+
+        // Fit before fetching, as `activateLayer` does: vector layers are queried
+        // by viewport, so framing the theme first means the requests ask for the
+        // area the operator is moving to.
+        if (visible) {
+          const ids = gisLayerRegistry
+            .listLayers()
+            .filter((layer) => layer.category === category)
+            .map((layer) => layer.id);
+          await controller.zoomToLayers(ids);
+        }
+
+        gisLayerRegistry.showCategory(category, visible);
+        await controller.sync();
+      },
+
+      zoomToLayer: async (layerId: string) => {
+        await gisControllerRef.current?.zoomToLayerData(layerId);
+      },
+
+      setOpacity: (layerId: string, opacity: number) => {
+        gisLayerRegistry.setOpacity(layerId, opacity);
+        gisControllerRef.current?.setOpacity(layerId, opacity);
+      },
+
+      highlight: (targets, options) => {
+        gisControllerRef.current?.showHighlight(targets, options);
+      },
+
+      clearHighlight: () => {
+        gisControllerRef.current?.clearHighlight();
+      },
+
+      fitBounds: (bounds, options) => {
+        gisControllerRef.current?.fitBounds(bounds, options);
+      },
+
+      flyTo: (lat: number, lng: number, zoom?: number) => {
+        mapInstanceRef.current?.flyTo([lat, lng], zoom ?? 16, { animate: true, duration: 1.2 });
+      },
+
+      currentBounds: () => gisControllerRef.current?.currentBounds() ?? null,
+
+      hideAll: () => {
+        gisLayerRegistry.hideAll();
+        gisControllerRef.current?.clearHighlight();
+        setGisSelection(null);
+        void gisControllerRef.current?.sync();
+      },
+
+      select: (selection: GISSelection) => {
+        setGisSelection(selection);
+      },
+    }),
+    [],
+  );
+
+  /**
+   * Datasets a nearby search may cover: the queryable layers currently drawn on
+   * the map. Scoping to what is displayed keeps the answer explainable from the
+   * screen rather than from an internal list the operator cannot see.
+   */
+  const gisNearbyScope = useMemo(() => {
+    const queryable = new Map(gis.provider.listQueryableLayers().map((l) => [l.layerId, l.label]));
+    return gis.layers
+      .filter((layer) => gis.runtime[layer.id]?.visible && queryable.has(layer.id))
+      .sort((a, b) => b.order - a.order)
+      .map((layer) => ({ layerId: layer.id, label: queryable.get(layer.id) as string }));
+  }, [gis.layers, gis.runtime, gis.provider]);
+
+  return (
+    <div className="relative flex-1 h-full bg-[#050505] overflow-hidden select-none flex flex-col">
+      {/* TOP INTEGRATED LAYER CONTROL TOOLBAR */}
+      <LayerControlToolbar
+        layersState={layersState}
+        setLayersState={setLayersState}
+        gisPanelOpen={gisPanelOpen}
+        onToggleGisPanel={() => setGisPanelOpen((open) => !open)}
+        gisLegendVisible={gisLegendVisible}
+        onToggleGisLegend={() => setGisLegendVisible((visible) => !visible)}
+        gisProvider={gis.provider}
+        gisLayers={gis.layers}
+        gisRuntime={gis.runtime}
+        gisActions={gisActions}
+      />
+
+      <div className="relative flex-1 w-full h-full overflow-hidden">
+        {/* Leaflet Map Canvas Container */}
+        <div
+          ref={mapContainerRef}
+          className="w-full h-full z-0 overflow-hidden"
+          style={{
+            transform: 'none',
+          }}
+        />
+
+        {/* Operational Map Context & Floating Search Bar */}
+        <div className="absolute top-3 left-4 z-10 pointer-events-auto flex items-center gap-2">
+          <form
+            onSubmit={handleSearch}
+            className="flex items-center gov-glass-interactive rounded-md px-3 py-1.5 w-64 shadow-2xl font-mono text-xs"
+          >
+            <Search className="w-3.5 h-3.5 text-white/40 mr-2" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search Bhubaneswar..."
+              className="bg-transparent text-white placeholder-white/30 focus:outline-none w-full"
+            />
+          </form>
+
+          {/* Operational Context Mode Switcher Bar */}
+          <div className="flex items-center bg-zinc-950/90 border border-zinc-800 rounded-md p-1 font-mono text-[11px] shadow-2xl gap-1">
+            <button
+              onClick={() => operationalStore.setMapMode('TRAFFIC_OPS')}
+              className={`px-2 py-1 rounded transition ${
+                useOperationalStore().mapMode === 'TRAFFIC_OPS'
+                  ? 'bg-orange-500 text-zinc-950 font-bold'
+                  : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              TRAFFIC OPS
+            </button>
+
+            <button
+              onClick={() => operationalStore.setMapMode('EMERGENCY_OPS')}
+              className={`px-2 py-1 rounded transition ${
+                useOperationalStore().mapMode === 'EMERGENCY_OPS'
+                  ? 'bg-red-500 text-zinc-950 font-bold'
+                  : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              EMERGENCY OPS
+            </button>
+
+            <button
+              onClick={() => operationalStore.setMapMode('ENVIRONMENTAL_OPS')}
+              className={`px-2 py-1 rounded transition ${
+                useOperationalStore().mapMode === 'ENVIRONMENTAL_OPS'
+                  ? 'bg-blue-500 text-zinc-950 font-bold'
+                  : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              ENVIRONMENTAL OPS
+            </button>
+
+            <button
+              onClick={() => operationalStore.setMapMode('AVIATION_OPS')}
+              className={`px-2 py-1 rounded transition ${
+                useOperationalStore().mapMode === 'AVIATION_OPS'
+                  ? 'bg-purple-500 text-zinc-950 font-bold'
+                  : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              AVIATION OPS
+            </button>
+          </div>
+        </div>
+
+        {/*
+          Map-derived cards, in a row over the map rather than beside it: what each
+          one reports is about geography on this same canvas. The wrapper is
+          pointer-events-none so the gap between cards stays draggable map.
+        */}
+        <div className="absolute top-14 left-4 z-30 flex items-start gap-2 max-w-[calc(100%-2rem)] pointer-events-none">
+          {/* Feature info card when a feature is selected */}
+          {gisSelection && (
+            <div className="pointer-events-auto">
+              <GISFeatureCard
+                selection={gisSelection}
+                provider={gis.provider}
+                actions={gisActions}
+                nearbyScope={gisNearbyScope}
+                basket={gisBasket}
+                onAddToAnalysis={(entry) =>
+                  setGisBasket((prev) =>
+                    // Same identity test the card uses to disable its own button,
+                    // so the control and the set can never disagree about whether
+                    // a feature is already collected.
+                    prev.some(
+                      (existing) =>
+                        existing.title === entry.title && existing.layerLabel === entry.layerLabel,
+                    )
+                      ? prev
+                      : [...prev, entry],
+                  )
+                }
+                onClearAnalysis={() => setGisBasket([])}
+                onClose={() => {
+                  setGisSelection(null);
+                  gisActions.clearHighlight();
+                }}
+              />
+            </div>
+          )}
+
+          {/*
+            Route calculation.
+
+            Sits with the other map-derived cards rather than in a dispatch sidebar:
+            what it reports — snapped start and end, segments traversed, validation
+            checks — is about geometry on this canvas.
+          */}
+          {routePanelOpen && (
+            <div className="pointer-events-auto">
+              <RoutePanel
+                routes={dispatchRoutes.routes}
+                calculating={dispatchRoutes.calculating}
+                capability={dispatchRoutes.capability}
+                advisories={dispatchRoutes.advisories}
+                incidentTitle={selectedIncident ? `${selectedIncident.id} · ${selectedIncident.title}` : null}
+                corridorStatus={{
+                  resolving: corridorGeometry.resolving,
+                  resolvedCount: corridorGeometry.resolvedCount,
+                  unresolvedCount: corridorGeometry.unresolvedCount,
+                  unresolved: corridorGeometry.unresolved,
+                }}
+                onFocusRoute={focusRoute}
+                onClose={() => setRoutePanelOpen(false)}
+              />
+            </div>
+          )}
+        </div>
+
+        {/* Legend for the active base GIS layers. Renders nothing when none are on. */}
+        {gisLegendVisible && (
+          <div className="absolute bottom-14 right-4 z-20 pointer-events-auto">
+            <GISLegend
+              layers={gis.layers}
+              runtime={gis.runtime}
+              actions={gisActions}
+              collapsed={gisLegendCollapsed}
+              onToggleCollapsed={() => setGisLegendCollapsed((collapsed) => !collapsed)}
+            />
+          </div>
+        )}
+
+        {/* Right Floating Map Control Tools */}
+        <div className="absolute top-16 right-4 z-10 flex flex-col space-y-2 pointer-events-auto font-mono">
+          <button
+            onClick={() => {
+              if (mapInstanceRef.current) {
+                mapInstanceRef.current.zoomIn();
+              }
+            }}
+            className="w-8 h-8 rounded bg-[#0A0A0A]/95 backdrop-blur-md border border-white/10 hover:border-[#06B6D4]/50 hover:bg-white/10 text-white flex items-center justify-center shadow-xl transition-all active:scale-95"
+            title="Zoom In"
+          >
+            <ZoomIn className="w-4 h-4 text-white" />
+          </button>
+          <button
+            onClick={() => {
+              if (mapInstanceRef.current) {
+                mapInstanceRef.current.zoomOut();
+              }
+            }}
+            className="w-8 h-8 rounded bg-[#0A0A0A]/95 backdrop-blur-md border border-white/10 hover:border-[#06B6D4]/50 hover:bg-white/10 text-white flex items-center justify-center shadow-xl transition-all active:scale-95"
+            title="Zoom Out"
+          >
+            <ZoomOut className="w-4 h-4 text-white" />
+          </button>
+          <button
+            onClick={resetHome}
+            className="w-8 h-8 rounded bg-[#0A0A0A]/95 backdrop-blur-md border border-white/10 hover:border-[#06B6D4] hover:bg-[#06B6D4]/10 text-[#06B6D4] flex items-center justify-center shadow-xl transition-all active:scale-95"
+            title="Reset to Bhubaneswar Home"
+          >
+            <Home className="w-4 h-4 text-[#06B6D4]" />
+          </button>
+          <button
+            onClick={() => setIs3DMode(!is3DMode)}
+            className={`w-8 h-8 rounded border backdrop-blur-md flex items-center justify-center shadow-xl transition-all active:scale-95 ${
+              is3DMode
+                ? 'bg-[#06B6D4]/15 text-[#06B6D4] border-[#06B6D4]/60 shadow-[0_0_12px_rgba(6,182,212,0.3)] ring-1 ring-[#06B6D4]/40'
+                : 'bg-[#0A0A0A]/95 text-white/40 border-white/10 hover:text-white'
+            }`}
+            title="Toggle 3D Perspective Mode"
+          >
+            <Box className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => {
+              const nextState = !isAutoRotateEnabled;
+              setIsAutoRotateEnabled(nextState);
+              if (!nextState) {
+                if (inactivityTimerRef.current !== null) {
+                  window.clearTimeout(inactivityTimerRef.current);
+                  inactivityTimerRef.current = null;
+                }
+                isUserInteractingRef.current = false;
+                rotationAngleRef.current = 0;
+                resetMapPaneTransform();
+              }
+            }}
+            className={`w-8 h-8 rounded border backdrop-blur-md flex items-center justify-center shadow-xl transition-all active:scale-95 relative ${
+              isAutoRotateEnabled
+                ? 'bg-[#06B6D4]/15 text-[#06B6D4] border-[#06B6D4]/60 shadow-[0_0_12px_rgba(6,182,212,0.3)] ring-1 ring-[#06B6D4]/40'
+                : 'bg-[#0A0A0A]/95 text-white/40 border-white/10 hover:text-white'
+            }`}
+            title={
+              isAutoRotateEnabled
+                ? 'Auto Rotate: ON (Slow Orbit - Pauses on interaction, resumes after 12s idle)'
+                : 'Auto Rotate: OFF (Click to enable slow continuous map rotation)'
+            }
+          >
+            <RotateCw className={`w-4 h-4 ${isAutoRotateEnabled ? 'text-[#06B6D4]' : ''}`} />
+            {isAutoRotateEnabled && (
+              <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-[#06B6D4] ring-2 ring-[#0A0A0A] animate-pulse" />
+            )}
+          </button>
+          <button
+            onClick={() => {
+              setMeasuringMode(!measuringMode);
+            }}
+            className={`w-8 h-8 rounded border backdrop-blur-md flex items-center justify-center shadow-xl transition-all active:scale-95 ${
+              measuringMode
+                ? 'bg-[#F59E0B]/20 text-[#F59E0B] border-[#F59E0B]/60 shadow-[0_0_12px_rgba(245,158,11,0.3)] ring-1 ring-[#F59E0B]/40'
+                : 'bg-[#0A0A0A]/95 text-white/40 border-white/10 hover:text-white'
+            }`}
+            title="Distance Measurement Tool"
+          >
+            <Ruler className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => setRoutePanelOpen((open) => !open)}
+            className={`relative w-8 h-8 rounded border backdrop-blur-md flex items-center justify-center shadow-xl transition-all active:scale-95 ${
+              routePanelOpen
+                ? 'bg-[#06B6D4]/15 text-[#06B6D4] border-[#06B6D4]/60 shadow-[0_0_12px_rgba(6,182,212,0.3)] ring-1 ring-[#06B6D4]/40'
+                : 'bg-[#0A0A0A]/95 text-white/40 border-white/10 hover:text-white'
+            }`}
+            title="Route calculation — road-network routing for the selected incident"
+          >
+            <RouteIcon className="w-4 h-4" />
+            {/* Only lit when a route has actually been calculated and validated. */}
+            {dispatchRoutes.routes.some((route) => route.status === 'VALID') && (
+              <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-[#06B6D4] border border-[#0A0A0A]" />
+            )}
+          </button>
+        </div>
+
+        {/* Dynamic Camera Live Stream Modal */}
+        {selectedCamera && (
+          <div className="absolute top-16 right-16 z-30 w-80 bg-[#0A0A0A]/95 backdrop-blur-md border border-indigo-500/50 rounded-lg p-3 font-mono text-xs shadow-2xl pointer-events-auto space-y-2.5">
+            <div className="flex items-center justify-between border-b border-white/10 pb-2">
+              <div className="flex items-center space-x-2">
+                <Video className="w-4 h-4 text-indigo-400 animate-pulse" />
+                <span className="font-bold text-white uppercase text-[11px] truncate max-w-[180px]">
+                  {selectedCamera.name}
+                </span>
+              </div>
+              <button onClick={() => setSelectedCamera(null)} className="text-white/40 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="relative aspect-video bg-black rounded overflow-hidden border border-white/10 group flex items-center justify-center">
+              {selectedCamera.streamUrl ? (
+                <video
+                  src={selectedCamera.streamUrl}
+                  autoPlay
+                  loop
+                  muted
+                  playsInline
+                  className="w-full h-full object-cover"
+                />
+              ) : selectedCamera.thumbnailUrl ? (
+                <img src={selectedCamera.thumbnailUrl} alt="CCTV Feed" className="w-full h-full object-cover opacity-80" />
+              ) : (
+                <div className="text-white/40 text-[10px]">Awaiting Live CCTV Feed...</div>
+              )}
+
+              {/* Animated AI Bounding Boxes Overlay */}
+              <div className="absolute inset-0 pointer-events-none p-3">
+                <div className="absolute top-1/4 left-1/3 w-16 h-12 border-2 border-amber-400/80 rounded bg-amber-400/10 flex items-start p-0.5">
+                  <span className="bg-amber-400 text-black text-[7px] font-bold px-1 rounded">VEHICLE #104</span>
+                </div>
+                <div className="absolute bottom-1/3 right-1/4 w-12 h-10 border-2 border-[#06B6D4]/80 rounded bg-[#06B6D4]/10 flex items-start p-0.5">
+                  <span className="bg-[#06B6D4] text-black text-[7px] font-bold px-1 rounded">ANPR READ</span>
+                </div>
+              </div>
+
+              <div className="absolute top-2 left-2 px-1.5 py-0.5 rounded bg-red-600 text-white font-bold text-[8px] flex items-center space-x-1 shadow-md">
+                <span className="w-1.5 h-1.5 rounded-full bg-white animate-ping" />
+                <span>RTSP LIVE</span>
+              </div>
+              <div className="absolute bottom-2 right-2 px-1.5 py-0.5 rounded bg-black/80 text-[#06B6D4] text-[8px] border border-white/10">
+                {selectedCamera.model}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 text-[10px]">
+              <div className="bg-white/[0.03] p-1.5 rounded border border-white/5">
+                <div className="text-white/40">VEHICLES DETECTED</div>
+                <div className="text-sm font-bold text-indigo-400">{selectedCamera.detectedVehicles}</div>
+              </div>
+              <div className="bg-white/[0.03] p-1.5 rounded border border-white/5">
+                <div className="text-white/40">PEDESTRIANS</div>
+                <div className="text-sm font-bold text-cyan-400">{selectedCamera.detectedPedestrians}</div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Hospital Telemetry Modal */}
+        {selectedHospital && (
+          <div className="absolute top-16 right-16 z-30 w-80 bg-[#0A0A0A]/95 backdrop-blur-md border border-rose-500/50 rounded-lg p-3 font-mono text-xs shadow-2xl pointer-events-auto space-y-2 font-mono">
+            <div className="flex items-center justify-between border-b border-white/10 pb-2">
+              <div className="flex items-center space-x-2">
+                <HeartPulse className="w-4 h-4 text-rose-400 animate-pulse" />
+                <span className="font-bold text-white uppercase text-[11px] truncate max-w-[180px]">
+                  {selectedHospital.name}
+                </span>
+              </div>
+              <button onClick={() => setSelectedHospital(null)} className="text-white/40 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="text-[10px] text-white/60">{selectedHospital.address}</div>
+
+            <div className="grid grid-cols-3 gap-1.5 text-[10px] text-center">
+              <div className="bg-white/[0.03] p-1.5 rounded border border-white/5">
+                <div className="text-white/40 text-[8px]">TOTAL BEDS</div>
+                <div className="font-bold text-white">{selectedHospital.totalBeds}</div>
+              </div>
+              <div className="bg-white/[0.03] p-1.5 rounded border border-white/5">
+                <div className="text-white/40 text-[8px]">AVAILABLE</div>
+                <div className="font-bold text-emerald-400">{selectedHospital.availableBeds}</div>
+              </div>
+              <div className="bg-white/[0.03] p-1.5 rounded border border-white/5">
+                <div className="text-white/40 text-[8px]">ICU BEDS</div>
+                <div className="font-bold text-cyan-400">{selectedHospital.availableICU}</div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Police Patrol Telemetry Modal */}
+        {selectedPolice && (
+          <div className="absolute top-16 right-16 z-30 w-80 bg-[#0A0A0A]/95 backdrop-blur-md border border-blue-500/50 rounded-lg p-3 font-mono text-xs shadow-2xl pointer-events-auto space-y-2">
+            <div className="flex items-center justify-between border-b border-white/10 pb-2">
+              <div className="flex items-center space-x-2">
+                <Shield className="w-4 h-4 text-blue-400 animate-pulse" />
+                <span className="font-bold text-white uppercase text-[11px] truncate max-w-[180px]">
+                  {selectedPolice.name}
+                </span>
+              </div>
+              <button onClick={() => setSelectedPolice(null)} className="text-white/40 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="text-[10px] text-white/60">SECTOR: {selectedPolice.sector}</div>
+            <div className="flex justify-between text-[10px] bg-white/[0.03] p-2 rounded border border-white/5">
+              <span>STATUS: <strong className="text-emerald-400">{selectedPolice.status}</strong></span>
+              <span>PERSONNEL: <strong className="text-white">{selectedPolice.personnelCount}</strong></span>
+            </div>
+          </div>
+        )}
+
+        {/* Fire Station Telemetry Modal */}
+        {selectedFire && (
+          <div className="absolute top-16 right-16 z-30 w-80 bg-[#0A0A0A]/95 backdrop-blur-md border border-orange-500/50 rounded-lg p-3 font-mono text-xs shadow-2xl pointer-events-auto space-y-2">
+            <div className="flex items-center justify-between border-b border-white/10 pb-2">
+              <div className="flex items-center space-x-2">
+                <Flame className="w-4 h-4 text-orange-400 animate-pulse" />
+                <span className="font-bold text-white uppercase text-[11px] truncate max-w-[180px]">
+                  {selectedFire.name}
+                </span>
+              </div>
+              <button onClick={() => setSelectedFire(null)} className="text-white/40 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="text-[10px] text-white/60">{selectedFire.address}</div>
+            <div className="grid grid-cols-2 gap-2 text-[10px]">
+              <div className="bg-white/[0.03] p-1.5 rounded border border-white/5">
+                <div className="text-white/40">TENDERS READY</div>
+                <div className="font-bold text-orange-400">{selectedFire.tendersAvailable}</div>
+              </div>
+              <div className="bg-white/[0.03] p-1.5 rounded border border-white/5">
+                <div className="text-white/40">FOAM CAPACITY</div>
+                <div className="font-bold text-white">{selectedFire.foamCapacityLiters} L</div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Utility Telemetry Modal */}
+        {selectedUtility && (
+          <div className="absolute top-16 right-16 z-30 w-80 bg-[#0A0A0A]/95 backdrop-blur-md border border-yellow-500/50 rounded-lg p-3 font-mono text-xs shadow-2xl pointer-events-auto space-y-2">
+            <div className="flex items-center justify-between border-b border-white/10 pb-2">
+              <div className="flex items-center space-x-2">
+                <Zap className="w-4 h-4 text-yellow-400 animate-pulse" />
+                <span className="font-bold text-white uppercase text-[11px] truncate max-w-[180px]">
+                  {selectedUtility.name}
+                </span>
+              </div>
+              <button onClick={() => setSelectedUtility(null)} className="text-white/40 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="text-[10px] text-white/60">ZONE: {selectedUtility.gridZone}</div>
+            <div className="bg-white/[0.03] p-2 rounded border border-white/5 space-y-1 text-[10px]">
+              <div className="flex justify-between">
+                <span>GRID LOAD:</span>
+                <strong className="text-yellow-400">{selectedUtility.currentLoadPct}%</strong>
+              </div>
+              <div className="flex justify-between">
+                <span>CAPACITY:</span>
+                <strong className="text-white">{selectedUtility.capacityMetric}</strong>
+              </div>
+              <div className="flex justify-between">
+                <span>AI OUTAGE RISK:</span>
+                <strong className={selectedUtility.outageRiskScore > 50 ? 'text-red-400' : 'text-emerald-400'}>
+                  {selectedUtility.outageRiskScore}% Risk
+                </strong>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Measurement Display */}
+        {measuringMode && (
+          <div className="absolute bottom-6 left-4 z-20 bg-[#0A0A0A]/95 backdrop-blur-md border border-[#F59E0B]/50 px-3.5 py-2 rounded-lg text-xs font-mono text-[#F59E0B] shadow-2xl flex items-center space-x-3 pointer-events-auto">
+            <Ruler className="w-4 h-4 text-[#F59E0B] animate-pulse shrink-0" />
+            <div className="flex items-center space-x-2">
+              <span>
+                {measuredDistance !== null
+                  ? `Total Distance: ${(measuredDistance / 1000).toFixed(2)} km (${measuredDistance} m)`
+                  : 'Click on 2 or more map locations to measure line distance...'}
+              </span>
+              {measurePointsRef.current.length > 0 && (
+                <button
+                  onClick={clearMeasurement}
+                  className="ml-2 px-2 py-0.5 rounded bg-[#F59E0B]/20 hover:bg-[#F59E0B]/30 border border-[#F59E0B]/50 text-[#F59E0B] text-[10px] font-bold transition-all"
+                >
+                  Clear Points
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Bottom Center Coordinate HUD */}
+        <div className="absolute bottom-2 right-4 z-10 px-3 py-1 rounded-md gov-glass text-[10px] font-mono text-white/40 flex items-center space-x-4 shadow-lg pointer-events-none uppercase">
+          <div>
+            LAT: <span className="text-[#06B6D4]">20.2961° N</span>
+          </div>
+          <div>
+            LNG: <span className="text-[#06B6D4]">85.8245° E</span>
+          </div>
+          <div>
+            ALT: <span className="text-white">45m AMSL</span>
+          </div>
+          <div>
+            DRAINAGE: <span className="text-[#10B981]">STABLE (62%)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
