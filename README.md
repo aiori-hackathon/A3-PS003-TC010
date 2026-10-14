@@ -4,3 +4,7 @@ This repository will contain the code and resources for the AIORI-3 hackathon th
 ## Team Introduction Video
 
 [Watch our team introduction video](https://www.youtube.com/watch?v=TUbgbsCnDKQ&list=PLXF85_UYfwdY)
+
+## ARKA Website
+
+[View our deployed website](https://infernox21.github.io/command)
